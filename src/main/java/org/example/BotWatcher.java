@@ -299,85 +299,62 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
             if (loginUrl == null || loginUrl.isBlank())
                 throw new IllegalStateException("WATCH_LOGIN_URL не задан.");
 
-            // 1) Всегда начинаем с login?next=<target>
+            // 1) стартуем с login?next=<WATCH_URL>
             String loginStart = loginUrl.contains("?")
                     ? loginUrl + "&next=" + java.net.URLEncoder.encode(targetUrl, java.nio.charset.StandardCharsets.UTF_8)
                     : loginUrl + "?next=" + java.net.URLEncoder.encode(targetUrl, java.nio.charset.StandardCharsets.UTF_8);
-
             driver.get(loginStart);
             waitDomReady(driver, 25);
             driver.switchTo().defaultContent();
 
-            // 2) Явно ждём поля логина/пароля
             WebDriverWait wait = new WebDriverWait(driver, java.time.Duration.ofSeconds(20));
             By emailSel = By.cssSelector("input[name='email']");
             By passSel  = By.cssSelector("input[name='password']");
-            WebElement emailInput = wait.until(org.openqa.selenium.support.ui.ExpectedConditions.visibilityOfElementLocated(emailSel));
-            WebElement passInput  = wait.until(org.openqa.selenium.support.ui.ExpectedConditions.visibilityOfElementLocated(passSel));
 
-            // 3) Ввод
+// 2) явные ожидания + ввод
+            WebElement emailInput = wait.until(org.openqa.selenium.support.ui.ExpectedConditions.elementToBeClickable(emailSel));
+            WebElement passInput  = wait.until(org.openqa.selenium.support.ui.ExpectedConditions.elementToBeClickable(passSel));
             emailInput.click(); emailInput.clear(); emailInput.sendKeys(username);
             passInput.click();  passInput.clear();  passInput.sendKeys(password);
 
-            // 4) Submit: сначала «обычный» клик
+// 3) submit: пробуем по кнопке, затем ENTER, затем JS
             By submitBtnSel = By.cssSelector("button.sf-auth-page-layout__submit-btn, button[type='submit'], input[type='submit']");
             java.util.List<WebElement> submitBtns = driver.findElements(submitBtnSel);
+            boolean clicked = false;
             if (!submitBtns.isEmpty()) {
-                WebElement submit = wait.until(org.openqa.selenium.support.ui.ExpectedConditions.elementToBeClickable(submitBtns.get(0)));
-                submit.click();
-            } else {
-                passInput.sendKeys(org.openqa.selenium.Keys.ENTER);
+                try {
+                    WebElement btn = wait.until(org.openqa.selenium.support.ui.ExpectedConditions.elementToBeClickable(submitBtns.get(0)));
+                    // иногда помогает «наведение» перед кликом
+                    new org.openqa.selenium.interactions.Actions(driver).moveToElement(btn).pause(java.time.Duration.ofMillis(100)).click(btn).perform();
+                    clicked = true;
+                } catch (Exception ignored) {}
             }
-
-            // 5) Ожидание успеха: любой из трёх признаков
-            //    (а) ушли с /learning/login
-            //    (б) пропало поле password
-            //    (в) появились "session"-куки
-            WebDriverWait longWait = new WebDriverWait(driver, java.time.Duration.ofSeconds(30));
-            try {
-                longWait.until(d -> {
-                    String href = d.getCurrentUrl().toLowerCase(java.util.Locale.ROOT);
-                    boolean leftLogin = !href.contains("/learning/login");
-                    boolean noPwd = d.findElements(By.cssSelector("input[type='password']")).isEmpty();
-                    boolean hasSess = false;
-                    try {
-                        String cookies = (String)((org.openqa.selenium.JavascriptExecutor)d).executeScript("return document.cookie||'';");
-                        // эвристика: наличие любой cookie с именем, похожим на session/csrf/jwt/edx
-                        hasSess = cookies.matches("(?i).*\\b(session|sess|csrftoken|jwt|edx)\\b.*");
-                    } catch (Throwable ignore) {}
-                    return leftLogin || noPwd || hasSess;
-                });
-            } catch (org.openqa.selenium.TimeoutException te) {
-                // Fallback: JS-submit (React-friendly) + повторное ожидание
-                System.out.println("Click/ENTER не сработал, пробую JS-submit…");
+            if (!clicked) {
+                try { passInput.sendKeys(org.openqa.selenium.Keys.ENTER); clicked = true; } catch (Exception ignored) {}
+            }
+            if (!clicked) {
+                // React-friendly JS submit
                 org.openqa.selenium.JavascriptExecutor js = (org.openqa.selenium.JavascriptExecutor) driver;
-                String setAndSubmit = """
-                (function(email, pass){
-                  const $e = document.querySelector("input[name='email']");
-                  const $p = document.querySelector("input[name='password']");
-                  if(!$e || !$p) return "NO_FIELDS";
-                  function setVal(el, val){
-                    const last = el.value;
-                    el.focus();
-                    el.value = val;
-                    const inputEvt  = new Event('input',{bubbles:true});
-                    const changeEvt = new Event('change',{bubbles:true});
-                    el.dispatchEvent(inputEvt);
-                    if (last !== val) el.dispatchEvent(changeEvt);
-                  }
-                  setVal($e, email);
-                  setVal($p, pass);
-                  const form = $e.closest("form") || $p.closest("form") || document.querySelector("form");
-                  if (form && typeof form.requestSubmit === 'function') { form.requestSubmit(); return "SUBMIT_FORM"; }
-                  const btn = document.querySelector("button.sf-auth-page-layout__submit-btn, button[type='submit'], input[type='submit']");
-                  if (btn) { btn.click(); return "CLICK_BUTTON"; }
-                  return "NO_SUBMIT";
-                })(arguments[0], arguments[1]);
-            """;
-                Object submitHow = js.executeScript(setAndSubmit, username, password);
-                System.out.println("JS submit result: " + submitHow);
+                Object r = js.executeScript("""
+      (function(){
+        const $e=document.querySelector("input[name='email']");
+        const $p=document.querySelector("input[name='password']");
+        if(!$e||!$p) return "NO_FIELDS";
+        const form=$e.closest("form")||$p.closest("form")||document.querySelector("form");
+        if(form&&typeof form.requestSubmit==='function'){form.requestSubmit(); return "SUBMIT_FORM";}
+        const btn=document.querySelector("button.sf-auth-page-layout__submit-btn,button[type='submit'],input[type='submit']");
+        if(btn){btn.click(); return "CLICK_BUTTON";}
+        return "NO_SUBMIT";
+      })();
+    """);
+                System.out.println("Submit fallback JS: " + r);
+            }
 
-                longWait.until(d -> {
+// 4) ждём УСПЕХ: ушли с /learning/login ИЛИ пропало password-поле ИЛИ появились «сессионные» куки
+            WebDriverWait longWait = new WebDriverWait(driver, java.time.Duration.ofSeconds(35));
+            boolean success = false;
+            try {
+                success = longWait.until(d -> {
                     String href = d.getCurrentUrl().toLowerCase(java.util.Locale.ROOT);
                     boolean leftLogin = !href.contains("/learning/login");
                     boolean noPwd = d.findElements(By.cssSelector("input[type='password']")).isEmpty();
@@ -388,13 +365,62 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                     } catch (Throwable ignore) {}
                     return leftLogin || noPwd || hasSess;
                 });
+            } catch (org.openqa.selenium.TimeoutException ignored) {
+                success = false;
             }
 
-            // 6) Переходим на целевой URL (редирект мог и не сработать)
+// 5) если не получилось — соберём текст ошибок и (по желанию) дадим шанс ручного входа
+            if (!success) {
+                // попробуем достать сообщение об ошибке валидации/авторизации
+                String errText = "";
+                try {
+                    String jsGetErrors = """
+          return Array.from(document.querySelectorAll(
+            ".sf-input-text__error, [role='alert'], .sf-notification, .sf-text--error, .error"
+          )).map(el => el.innerText.trim()).filter(Boolean).join(" | ");
+        """;
+                    errText = (String)((org.openqa.selenium.JavascriptExecutor)driver).executeScript(jsGetErrors);
+                } catch (Throwable ignored) {}
+                if (errText != null && !errText.isBlank()) {
+                    System.err.println("Login validation message: " + errText);
+                }
+
+                boolean interactive = Boolean.parseBoolean(getenvOrDefault("LOGIN_INTERACTIVE", "false"));
+                if (interactive) {
+                    System.out.println("Login didn’t pass automatically. You have 120s to login manually in the opened browser window…");
+                    long until = System.currentTimeMillis() + 120_000L;
+                    while (System.currentTimeMillis() < until) {
+                        try {
+                            // признак успеха тот же
+                            String href = driver.getCurrentUrl().toLowerCase(java.util.Locale.ROOT);
+                            boolean leftLogin = !href.contains("/learning/login");
+                            boolean noPwd = driver.findElements(By.cssSelector("input[type='password']")).isEmpty();
+                            String cookies = (String)((org.openqa.selenium.JavascriptExecutor)driver).executeScript("return document.cookie||'';");
+                            boolean hasSess = cookies.matches("(?i).*\\b(session|sess|csrftoken|jwt|edx)\\b.*");
+                            if (leftLogin || noPwd || hasSess) { success = true; break; }
+                        } catch (Throwable ignored) {}
+                        try { Thread.sleep(750); } catch (InterruptedException ignored) {}
+                    }
+                }
+
+                if (!success) {
+                    // снимем диагностику и прервём
+                    try { File h = writeTemp("login-fail-", ".html", driver.getPageSource()); System.err.println("Saved " + h.getAbsolutePath()); } catch (Throwable ignored) {}
+                    try {
+                        byte[] shot = ((org.openqa.selenium.TakesScreenshot) driver).getScreenshotAs(org.openqa.selenium.OutputType.BYTES);
+                        File p = File.createTempFile("login-fail-", ".png");
+                        try (java.io.FileOutputStream fos = new java.io.FileOutputStream(p)) { fos.write(shot); }
+                        System.err.println("Saved " + p.getAbsolutePath());
+                    } catch (Throwable ignored) {}
+                    throw new IllegalStateException("Не удалось пройти логин автоматически. " +
+                            (errText.isBlank() ? "" : ("Сообщение на странице: " + errText)));
+                }
+            }
+
+// 6) на всякий — принудительно переходим на твой targetUrl
             driver.switchTo().defaultContent();
             driver.get(targetUrl);
             waitDomReady(driver, 25);
-
             // 7) Ждём контент
             String primary = (contentSelector != null && !contentSelector.isBlank()) ? contentSelector : null;
             String fallback = (waitSelectorFallback == null || waitSelectorFallback.isBlank()) ? "#root > *" : waitSelectorFallback;
