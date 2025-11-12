@@ -45,6 +45,10 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
     private static final String RENDER_UA      = getenvOrDefault("RENDER_USER_AGENT",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
     private static final String WATCH_WAIT_SELECTOR = getenvOrDefault("WATCH_WAIT_SELECTOR", "#root > *");
+    private static final String WATCH_USERNAME = getenvOrDefault("WATCH_USERNAME", "");
+    private static final String WATCH_PASSWORD = getenvOrDefault("WATCH_PASSWORD", "");
+    private static final String WATCH_LOGIN_URL = getenvOrDefault("WATCH_LOGIN_URL", "");
+
 
     // ЕДИНСТВЕННЫЙ клиент Telegram
     private final TelegramClient client = new OkHttpTelegramClient(BOT_TOKEN);
@@ -152,18 +156,23 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                 }
 
                 case "render" -> {
-                    RenderResult rr = renderWithChrome(WATCH_URL, WATCH_COOKIES, WATCH_SELECTOR);
+                    if (WATCH_USERNAME.isBlank() || WATCH_PASSWORD.isBlank()) {
+                        send(chatId, "⚠️ Для /render с логином задайте WATCH_USERNAME и WATCH_PASSWORD в ENV.");
+                        break;
+                    }
+                    RenderResult rr = renderWithLogin(WATCH_URL, WATCH_COOKIES, WATCH_LOGIN_URL,
+                            WATCH_USERNAME, WATCH_PASSWORD, WATCH_SELECTOR, WATCH_WAIT_SELECTOR);
                     if (rr.htmlFile != null) {
-                        sendFile(chatId, rr.htmlFile, "rendered.html", "Рендеренный HTML (с JS)");
+                        sendFile(chatId, rr.htmlFile, "rendered.html", "Рендер после логина (HTML)");
                         //noinspection ResultOfMethodCallIgnored
                         rr.htmlFile.delete();
                     }
                     if (rr.pngFile != null) {
-                        sendFile(chatId, rr.pngFile, "rendered.png", "Скриншот (с JS)");
+                        sendFile(chatId, rr.pngFile, "rendered.png", "Скриншот после логина");
                         //noinspection ResultOfMethodCallIgnored
                         rr.pngFile.delete();
                     }
-                    send(chatId, "✅ render: status=" + rr.status + ", finalUrl=" + rr.finalUrl +
+                    send(chatId, "✅ render: finalUrl=" + rr.finalUrl +
                             (rr.selectorMatched ? ", selector OK" : ", selector NOT FOUND"));
                 }
 
@@ -262,86 +271,100 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
         }
     }
 
-    private static RenderResult renderWithChrome(String url, String cookieHeader, String selector) throws Exception {
+    private static RenderResult renderWithLogin(String targetUrl,
+                                                String cookieHeader,
+                                                String loginUrl,
+                                                String username,
+                                                String password,
+                                                String contentSelector,      // что снимать/ждать на целевой странице
+                                                String waitSelectorFallback  // резервный селектор ожидания (например #root > *)
+    ) throws Exception {
         WebDriverManager.chromedriver().setup();
-
         ChromeOptions opts = new ChromeOptions();
-        opts.addArguments(
-                "--headless=new",
-                "--disable-gpu",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--window-size=1366,3000",
-                "--lang=ru-RU",
-                "--user-agent=" + RENDER_UA
-        );
-        // Чуть «нативнее» поведение
-        opts.setExperimentalOption("excludeSwitches", List.of("enable-automation"));
-        opts.setExperimentalOption("useAutomationExtension", false);
-
+        opts.addArguments("--headless=new", "--no-sandbox", "--disable-dev-shm-usage",
+                "--window-size=1366,3000", "--lang=ru-RU", "--user-agent=" + RENDER_UA);
         WebDriver driver = new ChromeDriver(opts);
         try {
-            // 1) Зайти на origin, чтобы иметь право ставить куки
-            String origin = originOf(url); // https://apps.skillfactory.ru/
+            // 0) Если есть предварительные cookies — ставим их на origin (иногда SSO пропустит сразу)
+            String origin = originOf(targetUrl);
             driver.get(origin);
-
-            // 2) Установить куки (если заданы)
             Map<String,String> ck = parseCookieHeader(cookieHeader);
-            String domain = new java.net.URI(origin).getHost(); // apps.skillfactory.ru
+            String domain = new java.net.URI(origin).getHost();
             for (var e : ck.entrySet()) {
                 Cookie c = new Cookie.Builder(e.getKey(), e.getValue())
-                        .domain(domain)
-                        .path("/")
-                        .isHttpOnly(false)
-                        .isSecure(true)
-                        .build();
+                        .domain(domain).path("/").isSecure(true).build();
                 driver.manage().addCookie(c);
             }
 
-            // 3) Открыть целевой URL
-            driver.get(url);
+            // 1) Открываем целевую
+            driver.get(targetUrl);
+            waitDomReady(driver, 25);
 
-            // 4) Дождаться полной загрузки документа
-            new WebDriverWait(driver, Duration.ofSeconds(25)).until(
-                    wd -> "complete".equals(((JavascriptExecutor) wd).executeScript("return document.readyState"))
+            // 2) Если видим логин — логинимся
+            if (pageLooksLikeLogin(driver)) {
+                // если задан явный loginUrl — откроем его, иначе логинимся "на месте"
+                if (!loginUrl.isBlank()) {
+                    driver.get(loginUrl);
+                    waitDomReady(driver, 25);
+                }
+
+                // вводим логин/пароль (умные селекторы)
+                WebElement userEl = findAny(driver,
+                        "input[name='email']",
+                        "input[type='email']",
+                        "input[name='username']",
+                        "input#id_username",
+                        "input[name='login']"
+                );
+                WebElement passEl = findAny(driver,
+                        "input[name='password']",
+                        "input[type='password']",
+                        "input#id_password"
+                );
+                if (userEl == null || passEl == null) {
+                    throw new IllegalStateException("Не нашёл поля логина/пароля. Укажи WATCH_LOGIN_URL и пришли HTML формы.");
+                }
+                userEl.clear(); userEl.sendKeys(username);
+                passEl.clear(); passEl.sendKeys(password);
+
+                // кнопка входа
+                WebElement submitEl = findAny(driver,
+                        "button[type='submit']",
+                        "input[type='submit']",
+                        "button[class*='login']",
+                        "button:has(span:contains('Войти'))" // CSS4, может не поддерживаться; не критично
+                );
+                if (submitEl != null) submitEl.click(); else passEl.submit();
+
+                // ждём, чтобы ушли со страницы логина
+                new WebDriverWait(driver, Duration.ofSeconds(30)).until(d ->
+                        !pageLooksLikeLogin(d)
+                );
+            }
+
+            // 3) Убеждаемся, что мы на целевой странице (после логина SSO часто редиректит)
+            if (!driver.getCurrentUrl().startsWith(targetUrl)) {
+                driver.get(targetUrl);
+                waitDomReady(driver, 20);
+            }
+
+            // 4) Ждём контент курса: либо contentSelector, либо fallback (#root > *)
+            boolean matched = waitForSelectorOrRoot(driver,
+                    (contentSelector != null && !contentSelector.isBlank()) ? contentSelector : null,
+                    (waitSelectorFallback == null || waitSelectorFallback.isBlank()) ? "#root > *" : waitSelectorFallback,
+                    20
             );
 
-            // 5) Дождаться, пока React отрендерит контент:
-            //    — либо конкретный селектор (WATCH_SELECTOR),
-            //    — либо общий '#root > *' (WATCH_WAIT_SELECTOR),
-            //    — либо просто ненулевой innerText у root.
-            String waitSelector = (selector != null && !selector.isBlank())
-                    ? selector
-                    : WATCH_WAIT_SELECTOR;
-
-            boolean selectorMatched = false;
-            try {
-                selectorMatched = new WebDriverWait(driver, Duration.ofSeconds(20)).until(d ->
-                        (Boolean) ((JavascriptExecutor) d).executeScript(
-                                "const s=arguments[0];" +
-                                        "const el=document.querySelector(s);" +
-                                        "if(el) return true;" +
-                                        "const root=document.getElementById('root');" +
-                                        "return !!(root && root.children && root.children.length>0);",
-                                waitSelector
-                        )
-                );
-            } catch (TimeoutException ignored) { }
-
-            // 6) Чуть подождать сеть (простая «idle» эвристика)
+            // 5) небольшой idle и проскроллить
             try { Thread.sleep(800); } catch (InterruptedException ignored) {}
-
-            // 7) Прокрутить вниз, чтобы догрузить lazy-блоки
             try {
                 ((JavascriptExecutor) driver).executeScript("window.scrollTo(0, document.body.scrollHeight);");
                 Thread.sleep(400);
             } catch (Throwable ignored) {}
 
-            // 8) Снять HTML
+            // 6) Снимаем HTML и скрин
             String html = driver.getPageSource();
             File htmlFile = writeTemp("rendered-", ".html", html);
-
-            // 9) Скриншот экрана
             File pngFile = null;
             try {
                 byte[] shot = ((TakesScreenshot) driver).getScreenshotAs(OutputType.BYTES);
@@ -349,18 +372,58 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                 try (FileOutputStream fos = new FileOutputStream(pngFile)) { fos.write(shot); }
             } catch (Throwable ignored) {}
 
-            // В WebDriver нет прямого HTTP-статуса — считаем 200, если DOM живой
-            int status = 200;
-            String finalUrl = driver.getCurrentUrl();
-
-            return new RenderResult(status, finalUrl, selectorMatched, htmlFile, pngFile);
+            return new RenderResult(200, driver.getCurrentUrl(), matched, htmlFile, pngFile);
         } finally {
             driver.quit();
         }
     }
 
 
+
     /* ================== утилиты/отправка ================== */
+    private static void waitDomReady(WebDriver d, int sec) {
+        new WebDriverWait(d, Duration.ofSeconds(sec)).until(
+                wd -> "complete".equals(((JavascriptExecutor) wd).executeScript("return document.readyState"))
+        );
+    }
+
+    private static boolean pageLooksLikeLogin(WebDriver d) {
+        try {
+            // пароль на странице? часто верный индикатор
+            return d.findElements(By.cssSelector("input[type='password']")).size() > 0
+                    || ((String)((JavascriptExecutor) d).executeScript("return document.title||'';"))
+                    .toLowerCase(Locale.ROOT).contains("login");
+        } catch (Throwable t) { return false; }
+    }
+
+    private static boolean waitForSelectorOrRoot(WebDriver d, String primarySelector, String fallbackRootChild, int sec) {
+        try {
+            return new WebDriverWait(d, Duration.ofSeconds(sec)).until(dr -> {
+                JavascriptExecutor js = (JavascriptExecutor) dr;
+                if (primarySelector != null) {
+                    Boolean ok = (Boolean) js.executeScript("return document.querySelector(arguments[0])!=null;", primarySelector);
+                    if (Boolean.TRUE.equals(ok)) return true;
+                }
+                return (Boolean) js.executeScript(
+                        "const r=document.getElementById('root'); return !!(r && r.children && r.children.length>0) || !!document.querySelector(arguments[0]);",
+                        fallbackRootChild
+                );
+            });
+        } catch (TimeoutException te) {
+            return false;
+        }
+    }
+
+    private static WebElement findAny(WebDriver d, String... selectors) {
+        for (String s : selectors) {
+            try {
+                List<WebElement> els = d.findElements(By.cssSelector(s));
+                if (!els.isEmpty()) return els.get(0);
+            } catch (Throwable ignored) {}
+        }
+        return null;
+    }
+
 
     private void send(long chatId, String text) {
         try {
