@@ -44,6 +44,7 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
     private static final String WATCH_SELECTOR = getenvOrDefault("WATCH_SELECTOR", ""); // напр. "main"
     private static final String RENDER_UA      = getenvOrDefault("RENDER_USER_AGENT",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
+    private static final String WATCH_WAIT_SELECTOR = getenvOrDefault("WATCH_WAIT_SELECTOR", "#root > *");
 
     // ЕДИНСТВЕННЫЙ клиент Telegram
     private final TelegramClient client = new OkHttpTelegramClient(BOT_TOKEN);
@@ -265,20 +266,31 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
         WebDriverManager.chromedriver().setup();
 
         ChromeOptions opts = new ChromeOptions();
-        opts.addArguments("--headless=new", "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage",
-                "--window-size=1366,3000", "--lang=ru-RU", "--user-agent=" + RENDER_UA);
+        opts.addArguments(
+                "--headless=new",
+                "--disable-gpu",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--window-size=1366,3000",
+                "--lang=ru-RU",
+                "--user-agent=" + RENDER_UA
+        );
+        // Чуть «нативнее» поведение
+        opts.setExperimentalOption("excludeSwitches", List.of("enable-automation"));
+        opts.setExperimentalOption("useAutomationExtension", false);
 
         WebDriver driver = new ChromeDriver(opts);
         try {
-            // 1) зайти на origin домена, чтобы можно было добавить cookies
-            String origin = originOf(url);
+            // 1) Зайти на origin, чтобы иметь право ставить куки
+            String origin = originOf(url); // https://apps.skillfactory.ru/
             driver.get(origin);
 
-            // 2) добавить куки (если заданы)
+            // 2) Установить куки (если заданы)
             Map<String,String> ck = parseCookieHeader(cookieHeader);
+            String domain = new java.net.URI(origin).getHost(); // apps.skillfactory.ru
             for (var e : ck.entrySet()) {
                 Cookie c = new Cookie.Builder(e.getKey(), e.getValue())
-                        .domain(new URI(origin).getHost())
+                        .domain(domain)
                         .path("/")
                         .isHttpOnly(false)
                         .isSecure(true)
@@ -286,47 +298,67 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                 driver.manage().addCookie(c);
             }
 
-            // 3) открыть целевой URL
+            // 3) Открыть целевой URL
             driver.get(url);
 
-            // 4) подождать загрузку (readyState complete)
-            new WebDriverWait(driver, Duration.ofSeconds(20)).until(
-                    (ExpectedCondition<Boolean>) wd ->
-                            ((JavascriptExecutor) wd).executeScript("return document.readyState").equals("complete"));
+            // 4) Дождаться полной загрузки документа
+            new WebDriverWait(driver, Duration.ofSeconds(25)).until(
+                    wd -> "complete".equals(((JavascriptExecutor) wd).executeScript("return document.readyState"))
+            );
 
-            // 5) если задан селектор — пробуем дождаться его появления (мягко)
-            boolean matched = true;
-            if (selector != null && !selector.isBlank()) {
-                try {
-                    new WebDriverWait(driver, Duration.ofSeconds(10))
-                            .until(d -> (Boolean) ((JavascriptExecutor) d).executeScript(
-                                    "return document.querySelector(arguments[0])!=null;", selector));
-                } catch (TimeoutException te) { matched = false; }
-            }
+            // 5) Дождаться, пока React отрендерит контент:
+            //    — либо конкретный селектор (WATCH_SELECTOR),
+            //    — либо общий '#root > *' (WATCH_WAIT_SELECTOR),
+            //    — либо просто ненулевой innerText у root.
+            String waitSelector = (selector != null && !selector.isBlank())
+                    ? selector
+                    : WATCH_WAIT_SELECTOR;
 
-            // 6) HTML
+            boolean selectorMatched = false;
+            try {
+                selectorMatched = new WebDriverWait(driver, Duration.ofSeconds(20)).until(d ->
+                        (Boolean) ((JavascriptExecutor) d).executeScript(
+                                "const s=arguments[0];" +
+                                        "const el=document.querySelector(s);" +
+                                        "if(el) return true;" +
+                                        "const root=document.getElementById('root');" +
+                                        "return !!(root && root.children && root.children.length>0);",
+                                waitSelector
+                        )
+                );
+            } catch (TimeoutException ignored) { }
+
+            // 6) Чуть подождать сеть (простая «idle» эвристика)
+            try { Thread.sleep(800); } catch (InterruptedException ignored) {}
+
+            // 7) Прокрутить вниз, чтобы догрузить lazy-блоки
+            try {
+                ((JavascriptExecutor) driver).executeScript("window.scrollTo(0, document.body.scrollHeight);");
+                Thread.sleep(400);
+            } catch (Throwable ignored) {}
+
+            // 8) Снять HTML
             String html = driver.getPageSource();
             File htmlFile = writeTemp("rendered-", ".html", html);
 
-            // 7) Скриншот
+            // 9) Скриншот экрана
             File pngFile = null;
             try {
-                // скроллим в конец, чтобы прогрузить lazy-блоки
-                ((JavascriptExecutor) driver).executeScript("window.scrollTo(0, document.body.scrollHeight);");
-                Thread.sleep(500);
                 byte[] shot = ((TakesScreenshot) driver).getScreenshotAs(OutputType.BYTES);
                 pngFile = File.createTempFile("rendered-", ".png");
                 try (FileOutputStream fos = new FileOutputStream(pngFile)) { fos.write(shot); }
             } catch (Throwable ignored) {}
 
-            // 8) HTTP статус мы напрямую не знаем из WebDriver; условно считаем 200, если DOM не логин
-            int status = matched ? 200 : 200; // для простоты, основное — содержимое
+            // В WebDriver нет прямого HTTP-статуса — считаем 200, если DOM живой
+            int status = 200;
+            String finalUrl = driver.getCurrentUrl();
 
-            return new RenderResult(status, driver.getCurrentUrl(), matched, htmlFile, pngFile);
+            return new RenderResult(status, finalUrl, selectorMatched, htmlFile, pngFile);
         } finally {
             driver.quit();
         }
     }
+
 
     /* ================== утилиты/отправка ================== */
 
