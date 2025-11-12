@@ -276,18 +276,35 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                                                 String loginUrl,
                                                 String username,
                                                 String password,
-                                                String contentSelector,      // что снимать/ждать на целевой странице
-                                                String waitSelectorFallback  // резервный селектор ожидания (например #root > *)
-    ) throws Exception {
+                                                String contentSelector,
+                                                String waitSelectorFallback) throws Exception {
         WebDriverManager.chromedriver().setup();
         ChromeOptions opts = new ChromeOptions();
-        opts.addArguments("--headless=new", "--no-sandbox", "--disable-dev-shm-usage",
-                "--window-size=1366,3000", "--lang=ru-RU", "--user-agent=" + RENDER_UA);
+        opts.addArguments(
+                "--headless=new",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--window-size=1366,3000",
+                "--lang=ru-RU",
+                "--user-agent=" + RENDER_UA,
+                // анти-детект
+                "--disable-blink-features=AutomationControlled"
+        );
+        // скрываем шильдик automation
+        opts.setExperimentalOption("excludeSwitches", List.of("enable-automation"));
+        opts.setExperimentalOption("useAutomationExtension", false);
+
         WebDriver driver = new ChromeDriver(opts);
+        File diagLoginHtml = null, diagLoginPng = null;
+        StringBuilder trace = new StringBuilder();
+
         try {
-            // 0) Если есть предварительные cookies — ставим их на origin (иногда SSO пропустит сразу)
             String origin = originOf(targetUrl);
             driver.get(origin);
+            trace.append("open origin: ").append(origin).append("\n");
+
+            // Предварительные cookies (если есть)
             Map<String,String> ck = parseCookieHeader(cookieHeader);
             String domain = new java.net.URI(origin).getHost();
             for (var e : ck.entrySet()) {
@@ -296,73 +313,101 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                 driver.manage().addCookie(c);
             }
 
-            // 1) Открываем целевую
+            // 1) Идём на целевую
             driver.get(targetUrl);
             waitDomReady(driver, 25);
+            trace.append("open target: ").append(driver.getCurrentUrl()).append("\n");
 
-            // 2) Если видим логин — логинимся
+            // 2) Если это логин — логинимся
             if (pageLooksLikeLogin(driver)) {
-                // если задан явный loginUrl — откроем его, иначе логинимся "на месте"
-                if (!loginUrl.isBlank()) {
-                    driver.get(loginUrl);
+                trace.append("looks like login at: ").append(driver.getCurrentUrl()).append("\n");
+
+                // если задан loginUrl — пойдём туда, иначе попробуем логиниться на месте;
+                String actualLoginUrl = (loginUrl != null && !loginUrl.isBlank())
+                        ? loginUrl
+                        : guessLoginUrl(driver.getCurrentUrl()); // попытка угадать lms.skillfactory.ru/login
+
+                if (actualLoginUrl != null) {
+                    driver.get(actualLoginUrl);
                     waitDomReady(driver, 25);
+                    trace.append("goto login: ").append(driver.getCurrentUrl()).append("\n");
                 }
 
-                // вводим логин/пароль (умные селекторы)
+                // иногда на странице логина есть переключатели "Войти по паролю"/"Через email"
+                clickIfPresent(driver,
+                        "button[id*='password']", "button[class*='password']",
+                        "button:has(span:contains('по паролю'))", "a:contains('по паролю')",
+                        "button:has(span:contains('Email'))", "a:contains('Email')"
+                );
+
+                // найдём поля (ключевые селекторы для Open edX/Keycloak/«обычных» форм)
                 WebElement userEl = findAny(driver,
                         "input[name='email']",
                         "input[type='email']",
                         "input[name='username']",
-                        "input#id_username",
+                        "#username",
+                        "#id_username",
                         "input[name='login']"
                 );
                 WebElement passEl = findAny(driver,
                         "input[name='password']",
-                        "input[type='password']",
-                        "input#id_password"
+                        "#password",
+                        "#id_password",
+                        "input[type='password']"
                 );
+
                 if (userEl == null || passEl == null) {
-                    throw new IllegalStateException("Не нашёл поля логина/пароля. Укажи WATCH_LOGIN_URL и пришли HTML формы.");
+                    // Снимем диагностический дамп формы логина
+                    String html = driver.getPageSource();
+                    diagLoginHtml = writeTemp("login-page-", ".html", html);
+                    try {
+                        byte[] shot = ((TakesScreenshot) driver).getScreenshotAs(OutputType.BYTES);
+                        diagLoginPng = File.createTempFile("login-page-", ".png");
+                        try (FileOutputStream fos = new FileOutputStream(diagLoginPng)) { fos.write(shot); }
+                    } catch (Throwable ignored) {}
+                    throw new IllegalStateException("Не нашёл поля логина/пароля. См. login-page.html/png.");
                 }
+
                 userEl.clear(); userEl.sendKeys(username);
                 passEl.clear(); passEl.sendKeys(password);
 
-                // кнопка входа
+                // submit
                 WebElement submitEl = findAny(driver,
                         "button[type='submit']",
                         "input[type='submit']",
-                        "button[class*='login']",
-                        "button:has(span:contains('Войти'))" // CSS4, может не поддерживаться; не критично
+                        "#kc-login",                         // Keycloak
+                        "button[class*='login']",            // generic
+                        "button:has(span:contains('Войти'))" // может не работать, если CSS4 не поддержан
                 );
                 if (submitEl != null) submitEl.click(); else passEl.submit();
 
-                // ждём, чтобы ушли со страницы логина
+                // ждём, чтобы ушли с логина/появился контент
                 new WebDriverWait(driver, Duration.ofSeconds(30)).until(d ->
                         !pageLooksLikeLogin(d)
                 );
+                trace.append("login ok, now: ").append(driver.getCurrentUrl()).append("\n");
             }
 
-            // 3) Убеждаемся, что мы на целевой странице (после логина SSO часто редиректит)
-            if (!driver.getCurrentUrl().startsWith(targetUrl)) {
+            // 3) Возвращаемся/переходим на целевой (после логина IdP мог редиректнуть куда-то ещё)
+            if (!samePath(driver.getCurrentUrl(), targetUrl)) {
                 driver.get(targetUrl);
                 waitDomReady(driver, 20);
+                trace.append("ensure target: ").append(driver.getCurrentUrl()).append("\n");
             }
 
-            // 4) Ждём контент курса: либо contentSelector, либо fallback (#root > *)
-            boolean matched = waitForSelectorOrRoot(driver,
-                    (contentSelector != null && !contentSelector.isBlank()) ? contentSelector : null,
-                    (waitSelectorFallback == null || waitSelectorFallback.isBlank()) ? "#root > *" : waitSelectorFallback,
-                    20
-            );
+            // 4) Ждём контент (селектор или #root>*)
+            String primary = (contentSelector != null && !contentSelector.isBlank()) ? contentSelector : null;
+            String fallback = (waitSelectorFallback == null || waitSelectorFallback.isBlank()) ? "#root > *" : waitSelectorFallback;
+            boolean matched = waitForSelectorOrRoot(driver, primary, fallback, 20);
 
-            // 5) небольшой idle и проскроллить
+            // 5) Немного подождать сеть/ленивые блоки
             try { Thread.sleep(800); } catch (InterruptedException ignored) {}
             try {
                 ((JavascriptExecutor) driver).executeScript("window.scrollTo(0, document.body.scrollHeight);");
                 Thread.sleep(400);
             } catch (Throwable ignored) {}
 
-            // 6) Снимаем HTML и скрин
+            // 6) HTML + скриншот
             String html = driver.getPageSource();
             File htmlFile = writeTemp("rendered-", ".html", html);
             File pngFile = null;
@@ -372,15 +417,49 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                 try (FileOutputStream fos = new FileOutputStream(pngFile)) { fos.write(shot); }
             } catch (Throwable ignored) {}
 
+            // Добавим трассу в начало HTML для твоей диагностики (комментом)
+            try (FileWriter fw = new FileWriter(htmlFile, StandardCharsets.UTF_8, true)) {
+                fw.write("\n<!-- TRACE:\n" + trace + "-->\n");
+            } catch (Exception ignored) {}
+
             return new RenderResult(200, driver.getCurrentUrl(), matched, htmlFile, pngFile);
+
         } finally {
             driver.quit();
         }
     }
 
 
-
     /* ================== утилиты/отправка ================== */
+
+    private static void clickIfPresent(WebDriver d, String... selectors) {
+        for (String s : selectors) {
+            try {
+                List<WebElement> els = d.findElements(By.cssSelector(s));
+                if (!els.isEmpty()) { els.get(0).click(); return; }
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    private static boolean samePath(String a, String b) {
+        try {
+            var ua = new java.net.URL(a); var ub = new java.net.URL(b);
+            return ua.getHost().equalsIgnoreCase(ub.getHost()) && ua.getPath().equals(ub.getPath());
+        } catch (Exception e) { return false; }
+    }
+
+    private static String guessLoginUrl(String current) {
+        try {
+            var u = new java.net.URL(current);
+            // Часто у Skillfactory логин на lms.skillfactory.ru
+            if (u.getHost().endsWith("skillfactory.ru")) {
+                return "https://lms.skillfactory.ru/login";
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+
     private static void waitDomReady(WebDriver d, int sec) {
         new WebDriverWait(d, Duration.ofSeconds(sec)).until(
                 wd -> "complete".equals(((JavascriptExecutor) wd).executeScript("return document.readyState"))
