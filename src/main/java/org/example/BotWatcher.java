@@ -67,6 +67,7 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
     private static final boolean RENDER_HEADLESS =
             Boolean.parseBoolean(getenvOrDefault("RENDER_HEADLESS", "false"));
 
+    private static volatile org.openqa.selenium.WebDriver CURRENT_DRIVER;
 
 
     // ЕДИНСТВЕННЫЙ клиент Telegram
@@ -100,6 +101,7 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                         /iframes — поиск iframe (без JS)
                         /open N  — скачать iframe N (без JS)
                         /render  — РЕНДЕР через Chrome: прислать rendered.html + rendered.png
+                        /checkjs — ПРОЙТИ таргеты с логином (Selenium) и прислать изменения
                         """);
                 return;
             }
@@ -194,9 +196,26 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                     send(chatId, "✅ render: finalUrl=" + rr.finalUrl +
                             (rr.selectorMatched ? ", selector OK" : ", selector NOT FOUND"));
                 }
+                case "checkjs" -> {
+                    // 1) гарантируем, что есть живой авторизованный Chrome
+                    WebDriver d = ensureLoggedInDriver();
+
+                    // 2) прогон таргетов из ChangeWatcher (go/clickText/wait/snap/хеш)
+                    var changes = ChangeWatcher.runChecks(d);
+
+                    // 3) репорт
+                    if (changes.isEmpty()) {
+                        send(chatId, "✓ Нет изменений (JS/после логина)");
+                    } else {
+                        for (var c : changes) {
+                            send(chatId, c.summary());
+                        }
+                    }
+                }
 
                 default -> send(chatId, "Команды: /status /check /why /html /iframes /open N /render");
             }
+
         } catch (Exception e) {
             e.printStackTrace();
             send(chatId, "⚠️ Ошибка: " + safe(e));
@@ -435,6 +454,7 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
             if (!KEEP_BROWSER_OPEN) {
                 try { driver.quit(); } catch (Throwable ignored) {}
             }
+            CURRENT_DRIVER = driver;
             return new RenderResult(200, driver.getCurrentUrl(), matched, htmlFile, pngFile);
 
         } catch (Exception e) {
@@ -459,6 +479,30 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
 
 
     /* ================== утилиты/отправка ================== */
+    private WebDriver ensureLoggedInDriver() throws Exception {
+        if (CURRENT_DRIVER != null) return CURRENT_DRIVER;
+
+        if (WATCH_USERNAME.isBlank() || WATCH_PASSWORD.isBlank() || WATCH_LOGIN_URL.isBlank()) {
+            throw new IllegalStateException("Для авторизации нужны WATCH_LOGIN_URL / WATCH_USERNAME / WATCH_PASSWORD.");
+        }
+
+        // Логинимся «как в /render», но без отправки файлов и т.п.
+        RenderResult rr = renderWithLogin(
+                WATCH_URL,
+                WATCH_COOKIES,
+                WATCH_LOGIN_URL,
+                WATCH_USERNAME,
+                WATCH_PASSWORD,
+                WATCH_SELECTOR,
+                WATCH_WAIT_SELECTOR
+        );
+        // renderWithLogin уже положит драйвер в CURRENT_DRIVER — просто вернём его:
+        if (CURRENT_DRIVER == null) {
+            throw new IllegalStateException("Логин не дал активный драйвер.");
+        }
+        return CURRENT_DRIVER;
+    }
+
 
     private static void clickIfPresent(WebDriver d, String... selectors) {
         for (String s : selectors) {
@@ -690,5 +734,6 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
             try { Thread.sleep(200); } catch (InterruptedException ignored) {}
         }
     }
+
 
 }
