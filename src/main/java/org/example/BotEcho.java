@@ -11,10 +11,11 @@ import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
 /**
- * Простейший эхо-бот. Использует BOT_TOKEN из переменной окружения.
+ * Simmple echo bot. Uses BOT_TOKEN from the environment variable.
  */
 public class BotEcho implements LongPollingSingleThreadUpdateConsumer {
     private final TelegramClient client;
+    private final String botName = requireEnv("BOT_USERNAME");
 
     public BotEcho(String token) {
         this.client = new OkHttpTelegramClient(token);
@@ -26,7 +27,7 @@ public class BotEcho implements LongPollingSingleThreadUpdateConsumer {
         BotEcho bot = new BotEcho(token);
         try (TelegramBotsLongPollingApplication app = new TelegramBotsLongPollingApplication()) {
             app.registerBot(token, bot);
-            System.out.println("✅ Echo bot started. Send /start or any text to your bot.");
+            System.out.println("Echo bot started. Send /start or any text to your bot.");
             Thread.currentThread().join(); // держим процесс
         }
     }
@@ -55,7 +56,7 @@ public class BotEcho implements LongPollingSingleThreadUpdateConsumer {
     private static String requireEnv(String key) {
         String v = System.getenv(key);
         if (v == null || v.isBlank())
-            throw new IllegalStateException("❌ Переменная окружения " + key + " не задана!");
+            throw new IllegalStateException("Переменная окружения " + key + " не задана!");
         return v;
     }
 }
