@@ -272,13 +272,12 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
     }
 
     private static RenderResult renderWithLogin(String targetUrl,
-                                                String cookieHeader,
+                                                String cookieHeader,          // игнорируем, оставлен только для сигнатуры
                                                 String loginUrl,
                                                 String username,
                                                 String password,
                                                 String contentSelector,
                                                 String waitSelectorFallback) throws Exception {
-        // Обязательно: сначала логинимся, потом переходим на targetUrl
         WebDriverManager.chromedriver().setup();
 
         ChromeOptions opts = new ChromeOptions();
@@ -292,7 +291,6 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                 "--user-agent=" + RENDER_UA,
                 "--disable-blink-features=AutomationControlled"
         );
-        // немного анти-детекта
         opts.setExperimentalOption("excludeSwitches", java.util.List.of("enable-automation"));
         opts.setExperimentalOption("useAutomationExtension", false);
 
@@ -304,24 +302,11 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                 throw new IllegalStateException("WATCH_LOGIN_URL не задан: нужно явно указать URL страницы логина.");
             }
 
-            // 0) Если передали куки — поставим их на домен логина (иногда помогает SSO)
-            if (cookieHeader != null && !cookieHeader.isBlank()) {
-                String loginOrigin = originOf(loginUrl);
-                driver.get(loginOrigin);
-                Map<String,String> ck = parseCookieHeader(cookieHeader);
-                String loginHost = new java.net.URI(loginOrigin).getHost();
-                for (var e : ck.entrySet()) {
-                    Cookie c = new Cookie.Builder(e.getKey(), e.getValue())
-                            .domain(loginHost).path("/").isSecure(true).build();
-                    driver.manage().addCookie(c);
-                }
-            }
-
-            // 1) ЯВНО идём на страницу логина apps.skillfactory.ru/learning/login
+            // 1) ЯВНО идём на страницу логина (apps.skillfactory.ru/learning/login)
             driver.get(loginUrl);
             waitDomReady(driver, 25);
 
-            // 2) Если логин в iframe — мягко попробуем зайти внутрь
+            // 2) На логине могут быть iframes — мягко попробуем зайти внутрь, если нужно
             try {
                 java.util.List<WebElement> frames = driver.findElements(By.cssSelector("iframe"));
                 for (WebElement f : frames) {
@@ -333,7 +318,7 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                 }
             } catch (Throwable ignore) {}
 
-            // 3) Установка email/пароля с диспатчем событий (React-friendly) и отправка формы
+            // 3) Вводим email/пароль через JS (генерируем input/change для React) и отправляем форму
             JavascriptExecutor js = (JavascriptExecutor) driver;
             String setAndSubmit = """
             (function(email, pass){
@@ -365,7 +350,7 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
             Object submitHow = js.executeScript(setAndSubmit, username, password);
             System.out.println("Login submit: " + submitHow);
 
-            // 4) Ждём ухода со страницы логина или хотя бы исчезновения password-поля
+            // 4) Ждём, пока уйдём со страницы логина ИЛИ исчезнет поле пароля (SPA может остаться на /learning/login?next=...)
             new WebDriverWait(driver, java.time.Duration.ofSeconds(30)).until(d -> {
                 String href = d.getCurrentUrl().toLowerCase(java.util.Locale.ROOT);
                 boolean leftLogin = !href.contains("/learning/login");
@@ -373,37 +358,36 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                 return leftLogin || noPwd;
             });
 
-            // 5) Возвращаемся (или переходим) на целевой URL и ждём готовности
+            // 5) Теперь переходим на целевой URL и ждём готовности DOM
             driver.switchTo().defaultContent();
             driver.get(targetUrl);
             waitDomReady(driver, 25);
 
-            // 6) Ждём контент: либо WATCH_SELECTOR, либо запасной (#root > *)
+            // 6) Ждём появление контента: либо WATCH_SELECTOR, либо запасной "#root > *"
             String primary = (contentSelector != null && !contentSelector.isBlank()) ? contentSelector : null;
             String fallback = (waitSelectorFallback == null || waitSelectorFallback.isBlank()) ? "#root > *" : waitSelectorFallback;
             boolean matched = waitForSelectorOrRoot(driver, primary, fallback, 20);
 
-            // 7) Лёгкая задержка + скролл для догрузки lazy-блоков
+            // 7) Небольшая задержка, скролл, съёмка
             try { Thread.sleep(800); } catch (InterruptedException ignored) {}
             try {
                 ((JavascriptExecutor) driver).executeScript("window.scrollTo(0, document.body.scrollHeight);");
                 Thread.sleep(400);
             } catch (Throwable ignored) {}
 
-            // 8) Снимаем HTML и скрин
             String html = driver.getPageSource();
             File htmlFile = writeTemp("rendered-", ".html", html);
             File pngFile = null;
             try {
                 byte[] shot = ((TakesScreenshot) driver).getScreenshotAs(OutputType.BYTES);
                 pngFile = File.createTempFile("rendered-", ".png");
-                try (FileOutputStream fos = new FileOutputStream(pngFile)) { fos.write(shot); }
+                try (java.io.FileOutputStream fos = new java.io.FileOutputStream(pngFile)) { fos.write(shot); }
             } catch (Throwable ignored) {}
 
             return new RenderResult(200, driver.getCurrentUrl(), matched, htmlFile, pngFile);
 
         } catch (Exception e) {
-            // Диагностика формы логина при фейле
+            // Сохраним страницу/скрин логина для диагностики
             try {
                 String html = driver.getPageSource();
                 diagLoginHtml = writeTemp("login-page-", ".html", html);
@@ -411,7 +395,7 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
             try {
                 byte[] shot = ((TakesScreenshot) driver).getScreenshotAs(OutputType.BYTES);
                 diagLoginPng = File.createTempFile("login-page-", ".png");
-                try (FileOutputStream fos = new FileOutputStream(diagLoginPng)) { fos.write(shot); }
+                try (java.io.FileOutputStream fos = new java.io.FileOutputStream(diagLoginPng)) { fos.write(shot); }
             } catch (Throwable ignore) {}
 
             if (diagLoginHtml != null) System.err.println("Saved " + diagLoginHtml.getAbsolutePath());
@@ -421,6 +405,7 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
             driver.quit();
         }
     }
+
 
 
 
