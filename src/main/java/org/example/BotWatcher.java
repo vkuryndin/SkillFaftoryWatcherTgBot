@@ -52,11 +52,21 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
     // держим последнее окно браузера открытым (чтобы GC не прибил)
     private static volatile org.openqa.selenium.WebDriver LAST_DRIVER;
 
-    // конфиг ожидания после логина (мс) и поведение закрытия браузера
-    private static final long WAIT_AFTER_LOGIN_MS =
-            Long.parseLong(getenvOrDefault("WAIT_AFTER_LOGIN_MS", "3000"));  // 3 секунды
+     private static final long WAIT_AFTER_LOGIN_MS =
+            Long.parseLong(getenvOrDefault("WAIT_AFTER_LOGIN_MS", "6000"));       // пауза после логина
+
+    private static final long WAIT_TARGET_TIMEOUT_MS =
+            Long.parseLong(getenvOrDefault("WAIT_TARGET_TIMEOUT_MS", "15000"));    // общий таймаут ожидания добрузки
+
+    private static final long WAIT_TARGET_STABLE_MS =
+            Long.parseLong(getenvOrDefault("WAIT_TARGET_STABLE_MS", "1200"));      // «тишина» сети перед снимком
+
     private static final boolean KEEP_BROWSER_OPEN =
-            Boolean.parseBoolean(getenvOrDefault("KEEP_BROWSER_OPEN", "true")); // по умолчанию НЕ закрываем
+            Boolean.parseBoolean(getenvOrDefault("KEEP_BROWSER_OPEN", "true"));
+
+    private static final boolean RENDER_HEADLESS =
+            Boolean.parseBoolean(getenvOrDefault("RENDER_HEADLESS", "false"));
+
 
 
     // ЕДИНСТВЕННЫЙ клиент Telegram
@@ -289,10 +299,8 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                                                 String waitSelectorFallback) throws Exception {
         io.github.bonigarcia.wdm.WebDriverManager.chromedriver().setup();
 
-        // можно управлять headless через ENV: RENDER_HEADLESS=false — чтобы окно было видно
-        boolean headless = Boolean.parseBoolean(getenvOrDefault("RENDER_HEADLESS", "false"));
         org.openqa.selenium.chrome.ChromeOptions opts = new org.openqa.selenium.chrome.ChromeOptions();
-        if (headless) opts.addArguments("--headless=new");
+        if (RENDER_HEADLESS) opts.addArguments("--headless=new");
         opts.addArguments(
                 "--no-sandbox","--disable-dev-shm-usage","--disable-gpu",
                 "--window-size=1366,3000","--lang=ru-RU","--disable-blink-features=AutomationControlled",
@@ -302,7 +310,6 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
         opts.setExperimentalOption("useAutomationExtension", false);
 
         org.openqa.selenium.WebDriver driver = new org.openqa.selenium.chrome.ChromeDriver(opts);
-        // сохраним ссылку, чтобы окно не умерло, и чтобы можно было дебажить
         LAST_DRIVER = driver;
 
         java.io.File diagHtml = null, diagPng = null;
@@ -311,7 +318,7 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
             if (loginUrl == null || loginUrl.isBlank())
                 throw new IllegalStateException("WATCH_LOGIN_URL не задан.");
 
-            // 1) идём сразу на login?next=<target>
+            // 1) login?next=<WATCH_URL>
             String loginStart = loginUrl.contains("?")
                     ? loginUrl + "&next=" + java.net.URLEncoder.encode(targetUrl, java.nio.charset.StandardCharsets.UTF_8)
                     : loginUrl + "?next=" + java.net.URLEncoder.encode(targetUrl, java.nio.charset.StandardCharsets.UTF_8);
@@ -320,22 +327,19 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
             waitDomReady(driver, 25);
             driver.switchTo().defaultContent();
 
-            // 2) явные ожидания полей
+            // 2) поля логина
             org.openqa.selenium.support.ui.WebDriverWait wait =
                     new org.openqa.selenium.support.ui.WebDriverWait(driver, java.time.Duration.ofSeconds(20));
-            org.openqa.selenium.By emailSel = org.openqa.selenium.By.cssSelector("input[name='email']");
-            org.openqa.selenium.By passSel  = org.openqa.selenium.By.cssSelector("input[name='password']");
-            org.openqa.selenium.WebElement emailInput =
-                    wait.until(org.openqa.selenium.support.ui.ExpectedConditions.elementToBeClickable(emailSel));
-            org.openqa.selenium.WebElement passInput  =
-                    wait.until(org.openqa.selenium.support.ui.ExpectedConditions.elementToBeClickable(passSel));
+            var emailSel = org.openqa.selenium.By.cssSelector("input[name='email']");
+            var passSel  = org.openqa.selenium.By.cssSelector("input[name='password']");
+            var emailInput = wait.until(org.openqa.selenium.support.ui.ExpectedConditions.elementToBeClickable(emailSel));
+            var passInput  = wait.until(org.openqa.selenium.support.ui.ExpectedConditions.elementToBeClickable(passSel));
 
-            // 3) ввод
+            // 3) ввод и submit (кнопка → ENTER → JS)
             emailInput.click(); emailInput.clear(); emailInput.sendKeys(username);
             passInput.click();  passInput.clear();  passInput.sendKeys(password);
 
-            // 4) submit: кнопка → ENTER → JS
-            org.openqa.selenium.By submitBtnSel = org.openqa.selenium.By.cssSelector(
+            var submitBtnSel = org.openqa.selenium.By.cssSelector(
                     "button.sf-auth-page-layout__submit-btn, button[type='submit'], input[type='submit']"
             );
             java.util.List<org.openqa.selenium.WebElement> submitBtns = driver.findElements(submitBtnSel);
@@ -368,7 +372,7 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                 System.out.println("Submit fallback JS: " + r);
             }
 
-            // 5) ждём УСПЕХ: ушли с /learning/login ИЛИ пропало password ИЛИ появились «сессионные» куки
+            // 4) ждём успех логина (уход с /learning/login или пропало password или появились "session"-куки)
             org.openqa.selenium.support.ui.WebDriverWait longWait =
                     new org.openqa.selenium.support.ui.WebDriverWait(driver, java.time.Duration.ofSeconds(35));
             boolean success;
@@ -388,7 +392,6 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                 success = false;
             }
             if (!success) {
-                // диагностика и выход
                 try { diagHtml = writeTemp("login-fail-", ".html", driver.getPageSource()); } catch (Throwable ignore) {}
                 try {
                     byte[] shot = ((org.openqa.selenium.TakesScreenshot) driver).getScreenshotAs(org.openqa.selenium.OutputType.BYTES);
@@ -400,21 +403,24 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                 throw new IllegalStateException("Не удалось пройти логин автоматически.");
             }
 
-            // >>> ТВОЁ ТРЕБОВАНИЕ: подождать немного ПОСЛЕ ЛОГИНА <<<
+            // >>> ДОПОЛНИТЕЛЬНАЯ ПАУЗА ПОСЛЕ ЛОГИНА <<<
             try { Thread.sleep(WAIT_AFTER_LOGIN_MS); } catch (InterruptedException ignored) {}
 
-            // 6) теперь открываем целевую страницу
+            // 5) открываем целевую страницу
             driver.switchTo().defaultContent();
             driver.get(targetUrl);
             waitDomReady(driver, 25);
 
-            // 7) ждём контент
+            // 6) ждём первичный контент (селектор или #root > *)
             String primary = (contentSelector != null && !contentSelector.isBlank()) ? contentSelector : null;
             String fallbackSel = (waitSelectorFallback == null || waitSelectorFallback.isBlank()) ? "#root > *" : waitSelectorFallback;
             boolean matched = waitForSelectorOrRoot(driver, primary, fallbackSel, 25);
 
+            // 7) ЖДЁМ «СЕТЕВУЮ ТИШИНУ» SPA перед снимком (XHR/fetch закончились)
+            waitSpaNetworkIdle(driver, WAIT_TARGET_TIMEOUT_MS, WAIT_TARGET_STABLE_MS);
+
             // 8) лёгкий скролл + съёмка
-            try { Thread.sleep(800); } catch (InterruptedException ignored) {}
+            try { Thread.sleep(600); } catch (InterruptedException ignored) {}
             try { ((org.openqa.selenium.JavascriptExecutor) driver).executeScript("window.scrollTo(0, document.body.scrollHeight);"); Thread.sleep(400); } catch (Throwable ignored) {}
 
             String html = driver.getPageSource();
@@ -426,15 +432,12 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                 try (java.io.FileOutputStream fos = new java.io.FileOutputStream(pngFile)) { fos.write(shot); }
             } catch (Throwable ignored) {}
 
-            // важное: по просьбе — НЕ закрываем браузер
             if (!KEEP_BROWSER_OPEN) {
                 try { driver.quit(); } catch (Throwable ignored) {}
             }
-
             return new RenderResult(200, driver.getCurrentUrl(), matched, htmlFile, pngFile);
 
         } catch (Exception e) {
-            // сохраняем диагностику и НЕ закрываем браузер, чтобы можно было посмотреть, что случилось
             try { diagHtml = writeTemp("login-fail-", ".html", driver.getPageSource()); } catch (Throwable ignore) {}
             try {
                 byte[] shot = ((org.openqa.selenium.TakesScreenshot) driver).getScreenshotAs(org.openqa.selenium.OutputType.BYTES);
@@ -644,4 +647,48 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
     private static String safe(Throwable t) { String m = t.getMessage(); return (m == null || m.isBlank()) ? t.toString() : m; }
     private static String cmd(String text) { String t = text.startsWith("/") ? text.substring(1) : text; int sp = t.indexOf(' '); return (sp < 0 ? t : t.substring(0, sp)).toLowerCase(Locale.ROOT); }
     private static int parseIndex(String text) { try { String[] p = text.trim().split("\\s+"); if (p.length < 2) return -1; return Integer.parseInt(p[1]); } catch (Exception e) { return -1; } }
+
+    private static void waitSpaNetworkIdle(org.openqa.selenium.WebDriver d, long timeoutMs, long stableMs) {
+        org.openqa.selenium.JavascriptExecutor js = (org.openqa.selenium.JavascriptExecutor) d;
+        // инъекция мониторинга fetch/XHR (если ещё не стоит)
+        try {
+            js.executeScript("""
+            (function(){
+              if (window.__netmonInstalled) return;
+              window.__netmonInstalled = true;
+              window.__pendingRequests = 0;
+              const origFetch = window.fetch;
+              window.fetch = function(){
+                window.__pendingRequests++;
+                return origFetch.apply(this, arguments).finally(function(){ window.__pendingRequests--; });
+              };
+              const origSend = XMLHttpRequest.prototype.send;
+              XMLHttpRequest.prototype.send = function(){
+                window.__pendingRequests++;
+                this.addEventListener('loadend', function(){ window.__pendingRequests--; });
+                return origSend.apply(this, arguments);
+              };
+            })();
+        """);
+        } catch (Throwable ignored) {}
+
+        long end = System.currentTimeMillis() + timeoutMs;
+        long quietSince = -1L;
+        while (System.currentTimeMillis() < end) {
+            try {
+                Long pending = ((Number) js.executeScript("return (window.__pendingRequests||0);")).longValue();
+                Boolean hasSkeleton = (Boolean) js.executeScript(
+                        "return !!document.querySelector('.sf-skeleton, .skeleton, [data-loading=\"true\"], [aria-busy=\"true\"]);"
+                );
+                if (pending == 0 && !Boolean.TRUE.equals(hasSkeleton)) {
+                    if (quietSince < 0) quietSince = System.currentTimeMillis();
+                    if (System.currentTimeMillis() - quietSince >= stableMs) return; // «тишина» достаточно долго
+                } else {
+                    quietSince = -1L;
+                }
+            } catch (Throwable ignored) {}
+            try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+        }
+    }
+
 }
