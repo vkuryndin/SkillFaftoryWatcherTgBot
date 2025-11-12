@@ -1,0 +1,10 @@
+RENDER_HEADLESS=false
+KEEP_BROWSER_OPEN=true
+WATCH_LOGIN_URL=https://apps.skillfactory.ru/learning/login
+WATCH_USERNAME=...@...
+WATCH_PASSWORD=********
+WATCH_URL=https://apps.skillfactory.ru/learning/course/course-v1:skillfactory+MIFIDEV-1sem+JUN2025/home?pugId=15539
+WATCH_SELECTOR=main
+WAIT_AFTER_LOGIN_MS=8000
+WAIT_TARGET_TIMEOUT_MS=20000
+WAIT_TARGET_STABLE_MS=1500
