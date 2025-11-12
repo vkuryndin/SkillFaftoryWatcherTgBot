@@ -3,8 +3,8 @@ package org.example;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import org.openqa.selenium.*;
-import org.openqa.selenium.chrome.ChromeDriver;
-import org.openqa.selenium.chrome.ChromeOptions;
+import org.openqa.selenium.support.ui.ExpectedConditions;
+import org.openqa.selenium.support.ui.WebDriverWait;
 
 import java.io.*;
 import java.lang.reflect.Type;
@@ -12,32 +12,23 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.*;
-import java.util.concurrent.TimeUnit;
 
 /**
- * Простой «наблюдатель изменений» страниц после логина в браузере Selenium.
+ * Простой «наблюдатель изменений» страниц после логина (через уже авторизованный Selenium WebDriver).
  *
- * Как работает:
- *  - для каждой цели (Target) выполняет сценарий шагов: go/click/clickText/wait/waitText/snap
- *  - из SNAP-селектора извлекает нормализованный видимый текст, считает SHA-256
- *  - сравнивает с прошлым хэшем в watch-state.json; при отличии сообщает изменения
+ * Идея:
+ *  - Для каждой «цели» (Target) выполняем сценарий шагов: GO/CLICK/CLICK_TEXT(_ANY)/WAIT/WAIT_TEXT(_ANY)/SNAP
+ *  - По SNAP-селектору достаем нормализованный видимый текст и считаем SHA-256
+ *  - Храним прошлые хэши в watch-state.json; если хэш изменился — возвращаем Change (для отправки в Telegram)
  *
- * Использование из твоего бота:
- *  - после того как ты УЖЕ залогинился и у тебя есть активный WebDriver — вызови:
- *      List<ChangeWatcher.Change> changes = ChangeWatcher.runChecks(driver);
- *  - отправь summary() каждого Change в Telegram
- *
- * Быстрый standalone-тест (без бота):
- *  - выстави ENV: WATCH_LOGIN_URL, WATCH_URL, WATCH_USERNAME, WATCH_PASSWORD
- *  - запусти main(); откроется браузер, логин → проверки → оставит окно на 60 сек
+ * Вызов:
+ *  List<ChangeWatcher.Change> changes = ChangeWatcher.runChecks(driver);
+ *  (driver уже должен быть авторизован твоим кодом логина)
  */
 public class ChangeWatcher {
 
-    // ====== ТАРГЕТЫ (куда проваливаться и что сравнивать) ======
-    // Важно: WATCH_URL берём из ENV (это твой «дом» курса).
-    // Пример 1: главная курса → снимок <main>
-    // Пример 2: раздел «Объявления» (можешь поправить селекторы под реальный DOM)
-    // Пример 3: клик по тексту «Программирование на языке Java» → снимок <main>
+    /* ======================= ТАРГЕТЫ (редактируй под себя) ======================= */
+
     static final List<Target> TARGETS = List.of(
             new Target("Course: Home",
                     Steps.of(
@@ -50,8 +41,9 @@ public class ChangeWatcher {
                     Steps.of(
                             Step.go(env("WATCH_URL")),
                             Step.waitSel("#root > *"),
-                            Step.click("a[href*='announcements'], a[href*='news']"),
-                            Step.waitSel("main, .sf-announce-list, [data-announcements]"),
+                            Step.clickTextAny("Объявления", "Announcements", "Новости"),
+                            Step.waitTextAny("Объявления", "Announcements", "Новости"),
+                            Step.waitSel("main, .sf-announce-list, [data-announcements], #root > *"),
                             Step.snap("main, .sf-announce-list, [data-announcements]")
                     )
             ),
@@ -67,27 +59,35 @@ public class ChangeWatcher {
             )
     );
 
-    // ====== ПУБЛИЧНЫЙ API: вызвать после УСПЕШНОГО логина (driver уже авторизован) ======
+    /* ======================= Публичный API ======================= */
+
+    /** Запустить проверки всех TARGETS. Driver уже должен быть авторизован. */
     public static List<Change> runChecks(WebDriver driver) throws Exception {
         State state = State.load();
         List<Change> changes = new ArrayList<>();
 
         for (Target t : TARGETS) {
-            String text = runScenarioAndExtractText(driver, t.steps);
-            String hash = sha256(text);
-            String prev = state.hashes.get(t.name);
+            try {
+                String text = runScenarioAndExtractText(driver, t.steps);
+                String hash = sha256(text);
+                String prev = state.hashes.get(t.name);
 
-            if (prev == null || !prev.equals(hash)) {
-                changes.add(new Change(t.name, prev, hash, text));
-                state.hashes.put(t.name, hash);
-                state.updatedAt.put(t.name, Instant.now().toString());
+                if (prev == null || !prev.equals(hash)) {
+                    changes.add(new Change(t.name, prev, hash, text));
+                    state.hashes.put(t.name, hash);
+                    state.updatedAt.put(t.name, Instant.now().toString());
+                }
+            } catch (Exception ex) {
+                // не валим всю проверку из-за одной цели
+                System.err.println("Target failed: " + t.name + " — " + ex.getMessage());
             }
         }
         state.save();
         return changes;
     }
 
-    // ====== ВЫПОЛНЕНИЕ СЦЕНАРИЯ ДЛЯ ОДНОГО ТАРГЕТА ======
+    /* ======================= Выполнение сценария ======================= */
+
     private static String runScenarioAndExtractText(WebDriver d, List<Step> steps) throws Exception {
         for (Step s : steps) {
             switch (s.type) {
@@ -96,14 +96,21 @@ public class ChangeWatcher {
                     waitDomReady(d, 25);
                 }
                 case CLICK -> {
-                    WebElement el = findClickable(d, s.arg, 20);
+                    WebElement el = findClickable(d, s.arg, 25);
                     new org.openqa.selenium.interactions.Actions(d)
                             .moveToElement(el).pause(java.time.Duration.ofMillis(120)).click(el).perform();
                     sleep(600);
                     waitDomReady(d, 25);
                 }
                 case CLICK_TEXT -> {
-                    WebElement el = findClickableByText(d, s.arg, 25);
+                    WebElement el = findClickableByText(d, s.arg, 35);
+                    new org.openqa.selenium.interactions.Actions(d)
+                            .moveToElement(el).pause(java.time.Duration.ofMillis(120)).click(el).perform();
+                    sleep(700);
+                    waitDomReady(d, 25);
+                }
+                case CLICK_TEXT_ANY -> {
+                    WebElement el = findClickableByAnyText(d, splitAny(s.arg), 35);
                     new org.openqa.selenium.interactions.Actions(d)
                             .moveToElement(el).pause(java.time.Duration.ofMillis(120)).click(el).perform();
                     sleep(700);
@@ -113,33 +120,37 @@ public class ChangeWatcher {
                     waitVisible(d, s.arg, 25);
                 }
                 case WAIT_TEXT -> {
-                    waitTextPresent(d, s.arg, 25);
+                    waitTextPresent(d, s.arg, 30);
+                }
+                case WAIT_TEXT_ANY -> {
+                    waitAnyTextPresent(d, splitAny(s.arg), 30);
                 }
                 case SNAP -> {
                     waitVisible(d, s.arg, 30);
-                    // перед снимком подождём «сетевую тишину» SPA (если возможно)
+                    // дождаться «сетевой тишины» SPA
                     waitSpaNetworkIdle(d, 15000, 1200);
                     return extractNormalizedText(d, s.arg);
                 }
             }
         }
-        throw new IllegalStateException("Сценарий не завершён шагом SNAP — нечего сравнивать.");
+        throw new IllegalStateException("Сценарий не завершен шагом SNAP — нечего сравнивать.");
     }
 
-    // ====== УТИЛИТЫ SELENIUM ======
+    /* ======================= Selenium утилиты ======================= */
+
     private static void waitDomReady(WebDriver d, int sec) {
-        new org.openqa.selenium.support.ui.WebDriverWait(d, java.time.Duration.ofSeconds(sec))
+        new WebDriverWait(d, java.time.Duration.ofSeconds(sec))
                 .until(wd -> "complete".equals(((JavascriptExecutor) wd).executeScript("return document.readyState")));
     }
 
     private static void waitVisible(WebDriver d, String css, int sec) {
-        new org.openqa.selenium.support.ui.WebDriverWait(d, java.time.Duration.ofSeconds(sec))
-                .until(org.openqa.selenium.support.ui.ExpectedConditions.visibilityOfElementLocated(By.cssSelector(css)));
+        new WebDriverWait(d, java.time.Duration.ofSeconds(sec))
+                .until(ExpectedConditions.visibilityOfElementLocated(By.cssSelector(css)));
     }
 
     private static WebElement findClickable(WebDriver d, String css, int sec) {
-        var wait = new org.openqa.selenium.support.ui.WebDriverWait(d, java.time.Duration.ofSeconds(sec));
-        return wait.until(org.openqa.selenium.support.ui.ExpectedConditions.elementToBeClickable(By.cssSelector(css)));
+        return new WebDriverWait(d, java.time.Duration.ofSeconds(sec))
+                .until(ExpectedConditions.elementToBeClickable(By.cssSelector(css)));
     }
 
     private static String escapeXpath(String t){
@@ -156,8 +167,7 @@ public class ChangeWatcher {
 
     private static WebElement findClickableByText(WebDriver d, String text, int sec){
         String X = "//*[contains(normalize-space(.), " + escapeXpath(text) + ")]";
-        var wait = new org.openqa.selenium.support.ui.WebDriverWait(d, java.time.Duration.ofSeconds(sec));
-        return wait.until(w -> {
+        return new WebDriverWait(d, java.time.Duration.ofSeconds(sec)).until(w -> {
             List<WebElement> nodes = w.findElements(By.xpath(X));
             if (nodes.isEmpty()) return null;
             for (WebElement n : nodes) {
@@ -173,10 +183,48 @@ public class ChangeWatcher {
         });
     }
 
+    private static List<String> splitAny(String arg){
+        if (arg == null || arg.isBlank()) return List.of();
+        String[] parts = arg.split("\\|\\|");
+        List<String> out = new ArrayList<>();
+        for (String p : parts) { String s = p.trim(); if (!s.isEmpty()) out.add(s); }
+        return out;
+    }
+
+    private static WebElement findClickableByAnyText(WebDriver d, List<String> texts, int sec){
+        return new WebDriverWait(d, java.time.Duration.ofSeconds(sec)).until(w -> {
+            for (String t : texts) {
+                String X = "//*[contains(normalize-space(.), " + escapeXpath(t) + ")]";
+                List<WebElement> nodes = w.findElements(By.xpath(X));
+                for (WebElement n : nodes) {
+                    try {
+                        WebElement clickTarget = n;
+                        List<WebElement> ab = n.findElements(By.xpath("ancestor-or-self::a | ancestor-or-self::button"));
+                        if (!ab.isEmpty()) clickTarget = ab.get(0);
+                        ((JavascriptExecutor) w).executeScript("arguments[0].scrollIntoView({block:'center'});", clickTarget);
+                        if (clickTarget.isDisplayed() && clickTarget.isEnabled()) return clickTarget;
+                    } catch (Throwable ignore) {}
+                }
+            }
+            return null;
+        });
+    }
+
     private static void waitTextPresent(WebDriver d, String text, int sec){
         String X = "//*[contains(normalize-space(.), " + escapeXpath(text) + ")]";
-        new org.openqa.selenium.support.ui.WebDriverWait(d, java.time.Duration.ofSeconds(sec))
-                .until(org.openqa.selenium.support.ui.ExpectedConditions.presenceOfElementLocated(By.xpath(X)));
+        new WebDriverWait(d, java.time.Duration.ofSeconds(sec))
+                .until(ExpectedConditions.presenceOfElementLocated(By.xpath(X)));
+    }
+
+    private static void waitAnyTextPresent(WebDriver d, List<String> texts, int sec){
+        new WebDriverWait(d, java.time.Duration.ofSeconds(sec))
+                .until(web -> {
+                    for (String t : texts) {
+                        String X = "//*[contains(normalize-space(.), " + escapeXpath(t) + ")]";
+                        if (!web.findElements(By.xpath(X)).isEmpty()) return true;
+                    }
+                    return false;
+                });
     }
 
     private static String extractNormalizedText(WebDriver d, String css) {
@@ -201,6 +249,7 @@ public class ChangeWatcher {
         return t.trim();
     }
 
+    /** Ждём «сетевую тишину» SPA: нет fetch/XHR и нет skeleton-элементов. */
     private static void waitSpaNetworkIdle(WebDriver d, long timeoutMs, long stableMs) {
         JavascriptExecutor js = (JavascriptExecutor) d;
         try {
@@ -209,20 +258,18 @@ public class ChangeWatcher {
                   if (window.__netmonInstalled) return;
                   window.__netmonInstalled = true;
                   window.__pendingRequests = 0;
-                  const origFetch = window.fetch;
-                  if (origFetch) {
+                  const of = window.fetch;
+                  if (of) {
                     window.fetch = function(){
                       window.__pendingRequests++;
-                      return origFetch.apply(this, arguments).finally(function(){ window.__pendingRequests--; });
+                      return of.apply(this, arguments).finally(function(){ window.__pendingRequests--; });
                     };
                   }
-                  const origOpen = XMLHttpRequest.prototype.open;
-                  const origSend = XMLHttpRequest.prototype.send;
-                  XMLHttpRequest.prototype.open = function(){ return origOpen.apply(this, arguments); };
+                  const os = XMLHttpRequest.prototype.send;
                   XMLHttpRequest.prototype.send = function(){
                     window.__pendingRequests++;
                     this.addEventListener('loadend', function(){ window.__pendingRequests--; });
-                    return origSend.apply(this, arguments);
+                    return os.apply(this, arguments);
                   };
                 })();
             """);
@@ -253,7 +300,7 @@ public class ChangeWatcher {
 
     private static String sha256(String s) throws Exception {
         MessageDigest md = MessageDigest.getInstance("SHA-256");
-        byte[] h = md.digest(s.getBytes(StandardCharsets.UTF_8));
+        byte[] h = md.digest((s == null ? "" : s).getBytes(StandardCharsets.UTF_8));
         StringBuilder sb = new StringBuilder();
         for (byte b : h) sb.append(String.format("%02x", b));
         return sb.toString();
@@ -265,22 +312,29 @@ public class ChangeWatcher {
         return v;
     }
 
-    // ====== МОДЕЛИ ДАННЫХ ДЛЯ ШАГОВ И ТАРГЕТОВ ======
+    /* ======================= МОДЕЛИ/ТИПЫ ШАГОВ ======================= */
+
+    enum Type { GO, CLICK, CLICK_TEXT, CLICK_TEXT_ANY, WAIT, WAIT_TEXT, WAIT_TEXT_ANY, SNAP }
+
     record Step(Type type, String arg) {
         static Step go(String url){ return new Step(Type.GO, url); }
         static Step click(String css){ return new Step(Type.CLICK, css); }
         static Step clickText(String text){ return new Step(Type.CLICK_TEXT, text); }
+        static Step clickTextAny(String... texts){ return new Step(Type.CLICK_TEXT_ANY, String.join("||", texts)); }
         static Step waitSel(String css){ return new Step(Type.WAIT, css); }
         static Step waitText(String text){ return new Step(Type.WAIT_TEXT, text); }
+        static Step waitTextAny(String... texts){ return new Step(Type.WAIT_TEXT_ANY, String.join("||", texts)); }
         static Step snap(String css){ return new Step(Type.SNAP, css); }
     }
-    enum Type { GO, CLICK, CLICK_TEXT, WAIT, WAIT_TEXT, SNAP }
+
     record Steps(List<Step> list) {
         static List<Step> of(Step... steps){ return Arrays.asList(steps); }
     }
+
     record Target(String name, List<Step> steps) {}
 
-    // ====== ХРАНИЛКА СОСТОЯНИЯ ======
+    /* ======================= Cостояние (watch-state.json) ======================= */
+
     static class State {
         Map<String, String> hashes = new LinkedHashMap<>();
         Map<String, String> updatedAt = new LinkedHashMap<>();
@@ -312,7 +366,8 @@ public class ChangeWatcher {
         }
     }
 
-    // ====== ОПИСАНИЕ ИЗМЕНЕНИЙ (готово к отправке в Telegram) ======
+    /* ======================= Описание изменений ======================= */
+
     public record Change(String name, String prevHash, String newHash, String newText) {
         public String summary() {
             int len = newText == null ? 0 : newText.length();
@@ -320,47 +375,6 @@ public class ChangeWatcher {
                     "hash: " + shortHash(prevHash) + " → " + shortHash(newHash) + "\n" +
                     "len: " + len + " символов";
         }
-        private static String shortHash(String h) { return (h == null? "—" : h.substring(0, 8)); }
-    }
-
-    // ====== Пример самостоятельного запуска (отладка) ======
-    public static void main(String[] args) throws Exception {
-        // ENV: WATCH_LOGIN_URL, WATCH_URL, WATCH_USERNAME, WATCH_PASSWORD
-        System.setProperty("webdriver.http.factory", "jdk-http-client");
-        ChromeOptions opts = new ChromeOptions();
-        opts.addArguments("--no-sandbox","--disable-dev-shm-usage","--window-size=1366,3000");
-        WebDriver d = new ChromeDriver(opts);
-
-        try {
-            String login = System.getenv().getOrDefault("WATCH_LOGIN_URL", "https://apps.skillfactory.ru/learning/login");
-            String target = env("WATCH_URL");
-            String user = env("WATCH_USERNAME");
-            String pass = env("WATCH_PASSWORD");
-
-            // 1) login?next=<target>
-            String loginStart = login + (login.contains("?")? "&" : "?")
-                    + "next=" + java.net.URLEncoder.encode(target, StandardCharsets.UTF_8);
-            d.get(loginStart);
-            new org.openqa.selenium.support.ui.WebDriverWait(d, java.time.Duration.ofSeconds(20))
-                    .until(org.openqa.selenium.support.ui.ExpectedConditions.elementToBeClickable(By.cssSelector("input[name='email']")));
-            d.findElement(By.cssSelector("input[name='email']")).sendKeys(user);
-            d.findElement(By.cssSelector("input[name='password']")).sendKeys(pass + Keys.ENTER);
-            new org.openqa.selenium.support.ui.WebDriverWait(d, java.time.Duration.ofSeconds(35))
-                    .until(web -> !web.getCurrentUrl().toLowerCase(Locale.ROOT).contains("/learning/login"));
-
-            // 2) проверки
-            List<Change> changes = runChecks(d);
-            if (changes.isEmpty()) {
-                System.out.println("✓ Нет изменений");
-            } else {
-                for (Change c : changes) System.out.println(c.summary());
-            }
-
-            // оставим окно на минуту, чтобы посмотреть глазами
-            TimeUnit.SECONDS.sleep(60);
-
-        } finally {
-            d.quit();
-        }
+        private static String shortHash(String h) { return (h == null ? "—" : h.substring(0, 8)); }
     }
 }
