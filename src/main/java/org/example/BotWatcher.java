@@ -49,6 +49,15 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
     private static final String WATCH_PASSWORD = getenvOrDefault("WATCH_PASSWORD", "");
     private static final String WATCH_LOGIN_URL = getenvOrDefault("WATCH_LOGIN_URL", "");
 
+    // держим последнее окно браузера открытым (чтобы GC не прибил)
+    private static volatile org.openqa.selenium.WebDriver LAST_DRIVER;
+
+    // конфиг ожидания после логина (мс) и поведение закрытия браузера
+    private static final long WAIT_AFTER_LOGIN_MS =
+            Long.parseLong(getenvOrDefault("WAIT_AFTER_LOGIN_MS", "3000"));  // 3 секунды
+    private static final boolean KEEP_BROWSER_OPEN =
+            Boolean.parseBoolean(getenvOrDefault("KEEP_BROWSER_OPEN", "true")); // по умолчанию НЕ закрываем
+
 
     // ЕДИНСТВЕННЫЙ клиент Telegram
     private final TelegramClient client = new OkHttpTelegramClient(BOT_TOKEN);
@@ -272,17 +281,17 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
     }
 
     private static RenderResult renderWithLogin(String targetUrl,
-                                                String cookieHeader,          // не используем здесь
+                                                String cookieHeader,          // не используем
                                                 String loginUrl,
                                                 String username,
                                                 String password,
                                                 String contentSelector,
                                                 String waitSelectorFallback) throws Exception {
-        WebDriverManager.chromedriver().setup();
+        io.github.bonigarcia.wdm.WebDriverManager.chromedriver().setup();
 
-        // --- Chrome options (переключаемый headless) ---
-        boolean headless = Boolean.parseBoolean(getenvOrDefault("RENDER_HEADLESS", "true"));
-        ChromeOptions opts = new ChromeOptions();
+        // можно управлять headless через ENV: RENDER_HEADLESS=false — чтобы окно было видно
+        boolean headless = Boolean.parseBoolean(getenvOrDefault("RENDER_HEADLESS", "false"));
+        org.openqa.selenium.chrome.ChromeOptions opts = new org.openqa.selenium.chrome.ChromeOptions();
         if (headless) opts.addArguments("--headless=new");
         opts.addArguments(
                 "--no-sandbox","--disable-dev-shm-usage","--disable-gpu",
@@ -292,72 +301,82 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
         opts.setExperimentalOption("excludeSwitches", java.util.List.of("enable-automation"));
         opts.setExperimentalOption("useAutomationExtension", false);
 
-        WebDriver driver = new ChromeDriver(opts);
-        File diagHtml = null, diagPng = null;
+        org.openqa.selenium.WebDriver driver = new org.openqa.selenium.chrome.ChromeDriver(opts);
+        // сохраним ссылку, чтобы окно не умерло, и чтобы можно было дебажить
+        LAST_DRIVER = driver;
+
+        java.io.File diagHtml = null, diagPng = null;
 
         try {
             if (loginUrl == null || loginUrl.isBlank())
                 throw new IllegalStateException("WATCH_LOGIN_URL не задан.");
 
-            // 1) стартуем с login?next=<WATCH_URL>
+            // 1) идём сразу на login?next=<target>
             String loginStart = loginUrl.contains("?")
                     ? loginUrl + "&next=" + java.net.URLEncoder.encode(targetUrl, java.nio.charset.StandardCharsets.UTF_8)
                     : loginUrl + "?next=" + java.net.URLEncoder.encode(targetUrl, java.nio.charset.StandardCharsets.UTF_8);
+
             driver.get(loginStart);
             waitDomReady(driver, 25);
             driver.switchTo().defaultContent();
 
-            WebDriverWait wait = new WebDriverWait(driver, java.time.Duration.ofSeconds(20));
-            By emailSel = By.cssSelector("input[name='email']");
-            By passSel  = By.cssSelector("input[name='password']");
+            // 2) явные ожидания полей
+            org.openqa.selenium.support.ui.WebDriverWait wait =
+                    new org.openqa.selenium.support.ui.WebDriverWait(driver, java.time.Duration.ofSeconds(20));
+            org.openqa.selenium.By emailSel = org.openqa.selenium.By.cssSelector("input[name='email']");
+            org.openqa.selenium.By passSel  = org.openqa.selenium.By.cssSelector("input[name='password']");
+            org.openqa.selenium.WebElement emailInput =
+                    wait.until(org.openqa.selenium.support.ui.ExpectedConditions.elementToBeClickable(emailSel));
+            org.openqa.selenium.WebElement passInput  =
+                    wait.until(org.openqa.selenium.support.ui.ExpectedConditions.elementToBeClickable(passSel));
 
-// 2) явные ожидания + ввод
-            WebElement emailInput = wait.until(org.openqa.selenium.support.ui.ExpectedConditions.elementToBeClickable(emailSel));
-            WebElement passInput  = wait.until(org.openqa.selenium.support.ui.ExpectedConditions.elementToBeClickable(passSel));
+            // 3) ввод
             emailInput.click(); emailInput.clear(); emailInput.sendKeys(username);
             passInput.click();  passInput.clear();  passInput.sendKeys(password);
 
-// 3) submit: пробуем по кнопке, затем ENTER, затем JS
-            By submitBtnSel = By.cssSelector("button.sf-auth-page-layout__submit-btn, button[type='submit'], input[type='submit']");
-            java.util.List<WebElement> submitBtns = driver.findElements(submitBtnSel);
-            boolean clicked = false;
+            // 4) submit: кнопка → ENTER → JS
+            org.openqa.selenium.By submitBtnSel = org.openqa.selenium.By.cssSelector(
+                    "button.sf-auth-page-layout__submit-btn, button[type='submit'], input[type='submit']"
+            );
+            java.util.List<org.openqa.selenium.WebElement> submitBtns = driver.findElements(submitBtnSel);
+            boolean submitted = false;
             if (!submitBtns.isEmpty()) {
                 try {
-                    WebElement btn = wait.until(org.openqa.selenium.support.ui.ExpectedConditions.elementToBeClickable(submitBtns.get(0)));
-                    // иногда помогает «наведение» перед кликом
-                    new org.openqa.selenium.interactions.Actions(driver).moveToElement(btn).pause(java.time.Duration.ofMillis(100)).click(btn).perform();
-                    clicked = true;
+                    var btn = wait.until(org.openqa.selenium.support.ui.ExpectedConditions.elementToBeClickable(submitBtns.get(0)));
+                    new org.openqa.selenium.interactions.Actions(driver)
+                            .moveToElement(btn).pause(java.time.Duration.ofMillis(100)).click(btn).perform();
+                    submitted = true;
                 } catch (Exception ignored) {}
             }
-            if (!clicked) {
-                try { passInput.sendKeys(org.openqa.selenium.Keys.ENTER); clicked = true; } catch (Exception ignored) {}
+            if (!submitted) {
+                try { passInput.sendKeys(org.openqa.selenium.Keys.ENTER); submitted = true; } catch (Exception ignored) {}
             }
-            if (!clicked) {
-                // React-friendly JS submit
-                org.openqa.selenium.JavascriptExecutor js = (org.openqa.selenium.JavascriptExecutor) driver;
+            if (!submitted) {
+                var js = (org.openqa.selenium.JavascriptExecutor) driver;
                 Object r = js.executeScript("""
-      (function(){
-        const $e=document.querySelector("input[name='email']");
-        const $p=document.querySelector("input[name='password']");
-        if(!$e||!$p) return "NO_FIELDS";
-        const form=$e.closest("form")||$p.closest("form")||document.querySelector("form");
-        if(form&&typeof form.requestSubmit==='function'){form.requestSubmit(); return "SUBMIT_FORM";}
-        const btn=document.querySelector("button.sf-auth-page-layout__submit-btn,button[type='submit'],input[type='submit']");
-        if(btn){btn.click(); return "CLICK_BUTTON";}
-        return "NO_SUBMIT";
-      })();
-    """);
+              (function(){
+                const $e=document.querySelector("input[name='email']");
+                const $p=document.querySelector("input[name='password']");
+                if(!$e||!$p) return "NO_FIELDS";
+                const form=$e.closest("form")||$p.closest("form")||document.querySelector("form");
+                if(form&&typeof form.requestSubmit==='function'){form.requestSubmit(); return "SUBMIT_FORM";}
+                const btn=document.querySelector("button.sf-auth-page-layout__submit-btn,button[type='submit'],input[type='submit']");
+                if(btn){btn.click(); return "CLICK_BUTTON";}
+                return "NO_SUBMIT";
+              })();
+            """);
                 System.out.println("Submit fallback JS: " + r);
             }
 
-// 4) ждём УСПЕХ: ушли с /learning/login ИЛИ пропало password-поле ИЛИ появились «сессионные» куки
-            WebDriverWait longWait = new WebDriverWait(driver, java.time.Duration.ofSeconds(35));
-            boolean success = false;
+            // 5) ждём УСПЕХ: ушли с /learning/login ИЛИ пропало password ИЛИ появились «сессионные» куки
+            org.openqa.selenium.support.ui.WebDriverWait longWait =
+                    new org.openqa.selenium.support.ui.WebDriverWait(driver, java.time.Duration.ofSeconds(35));
+            boolean success;
             try {
                 success = longWait.until(d -> {
                     String href = d.getCurrentUrl().toLowerCase(java.util.Locale.ROOT);
                     boolean leftLogin = !href.contains("/learning/login");
-                    boolean noPwd = d.findElements(By.cssSelector("input[type='password']")).isEmpty();
+                    boolean noPwd = d.findElements(org.openqa.selenium.By.cssSelector("input[type='password']")).isEmpty();
                     boolean hasSess = false;
                     try {
                         String cookies = (String)((org.openqa.selenium.JavascriptExecutor)d).executeScript("return document.cookie||'';");
@@ -365,97 +384,73 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                     } catch (Throwable ignore) {}
                     return leftLogin || noPwd || hasSess;
                 });
-            } catch (org.openqa.selenium.TimeoutException ignored) {
+            } catch (org.openqa.selenium.TimeoutException te) {
                 success = false;
             }
-
-// 5) если не получилось — соберём текст ошибок и (по желанию) дадим шанс ручного входа
             if (!success) {
-                // попробуем достать сообщение об ошибке валидации/авторизации
-                String errText = "";
+                // диагностика и выход
+                try { diagHtml = writeTemp("login-fail-", ".html", driver.getPageSource()); } catch (Throwable ignore) {}
                 try {
-                    String jsGetErrors = """
-          return Array.from(document.querySelectorAll(
-            ".sf-input-text__error, [role='alert'], .sf-notification, .sf-text--error, .error"
-          )).map(el => el.innerText.trim()).filter(Boolean).join(" | ");
-        """;
-                    errText = (String)((org.openqa.selenium.JavascriptExecutor)driver).executeScript(jsGetErrors);
-                } catch (Throwable ignored) {}
-                if (errText != null && !errText.isBlank()) {
-                    System.err.println("Login validation message: " + errText);
-                }
-
-                boolean interactive = Boolean.parseBoolean(getenvOrDefault("LOGIN_INTERACTIVE", "false"));
-                if (interactive) {
-                    System.out.println("Login didn’t pass automatically. You have 120s to login manually in the opened browser window…");
-                    long until = System.currentTimeMillis() + 120_000L;
-                    while (System.currentTimeMillis() < until) {
-                        try {
-                            // признак успеха тот же
-                            String href = driver.getCurrentUrl().toLowerCase(java.util.Locale.ROOT);
-                            boolean leftLogin = !href.contains("/learning/login");
-                            boolean noPwd = driver.findElements(By.cssSelector("input[type='password']")).isEmpty();
-                            String cookies = (String)((org.openqa.selenium.JavascriptExecutor)driver).executeScript("return document.cookie||'';");
-                            boolean hasSess = cookies.matches("(?i).*\\b(session|sess|csrftoken|jwt|edx)\\b.*");
-                            if (leftLogin || noPwd || hasSess) { success = true; break; }
-                        } catch (Throwable ignored) {}
-                        try { Thread.sleep(750); } catch (InterruptedException ignored) {}
-                    }
-                }
-
-                if (!success) {
-                    // снимем диагностику и прервём
-                    try { File h = writeTemp("login-fail-", ".html", driver.getPageSource()); System.err.println("Saved " + h.getAbsolutePath()); } catch (Throwable ignored) {}
-                    try {
-                        byte[] shot = ((org.openqa.selenium.TakesScreenshot) driver).getScreenshotAs(org.openqa.selenium.OutputType.BYTES);
-                        File p = File.createTempFile("login-fail-", ".png");
-                        try (java.io.FileOutputStream fos = new java.io.FileOutputStream(p)) { fos.write(shot); }
-                        System.err.println("Saved " + p.getAbsolutePath());
-                    } catch (Throwable ignored) {}
-                    throw new IllegalStateException("Не удалось пройти логин автоматически. " +
-                            (errText.isBlank() ? "" : ("Сообщение на странице: " + errText)));
-                }
+                    byte[] shot = ((org.openqa.selenium.TakesScreenshot) driver).getScreenshotAs(org.openqa.selenium.OutputType.BYTES);
+                    diagPng = java.io.File.createTempFile("login-fail-", ".png");
+                    try (java.io.FileOutputStream fos = new java.io.FileOutputStream(diagPng)) { fos.write(shot); }
+                } catch (Throwable ignore) {}
+                if (diagHtml != null) System.err.println("Saved " + diagHtml.getAbsolutePath());
+                if (diagPng  != null) System.err.println("Saved " + diagPng.getAbsolutePath());
+                throw new IllegalStateException("Не удалось пройти логин автоматически.");
             }
 
-// 6) на всякий — принудительно переходим на твой targetUrl
+            // >>> ТВОЁ ТРЕБОВАНИЕ: подождать немного ПОСЛЕ ЛОГИНА <<<
+            try { Thread.sleep(WAIT_AFTER_LOGIN_MS); } catch (InterruptedException ignored) {}
+
+            // 6) теперь открываем целевую страницу
             driver.switchTo().defaultContent();
             driver.get(targetUrl);
             waitDomReady(driver, 25);
-            // 7) Ждём контент
-            String primary = (contentSelector != null && !contentSelector.isBlank()) ? contentSelector : null;
-            String fallback = (waitSelectorFallback == null || waitSelectorFallback.isBlank()) ? "#root > *" : waitSelectorFallback;
-            boolean matched = waitForSelectorOrRoot(driver, primary, fallback, 25);
 
-            // 8) Скролл + съёмка
+            // 7) ждём контент
+            String primary = (contentSelector != null && !contentSelector.isBlank()) ? contentSelector : null;
+            String fallbackSel = (waitSelectorFallback == null || waitSelectorFallback.isBlank()) ? "#root > *" : waitSelectorFallback;
+            boolean matched = waitForSelectorOrRoot(driver, primary, fallbackSel, 25);
+
+            // 8) лёгкий скролл + съёмка
             try { Thread.sleep(800); } catch (InterruptedException ignored) {}
             try { ((org.openqa.selenium.JavascriptExecutor) driver).executeScript("window.scrollTo(0, document.body.scrollHeight);"); Thread.sleep(400); } catch (Throwable ignored) {}
 
             String html = driver.getPageSource();
-            File htmlFile = writeTemp("rendered-", ".html", html);
-            File pngFile = null;
+            java.io.File htmlFile = writeTemp("rendered-", ".html", html);
+            java.io.File pngFile = null;
             try {
                 byte[] shot = ((org.openqa.selenium.TakesScreenshot) driver).getScreenshotAs(org.openqa.selenium.OutputType.BYTES);
-                pngFile = File.createTempFile("rendered-", ".png");
+                pngFile = java.io.File.createTempFile("rendered-", ".png");
                 try (java.io.FileOutputStream fos = new java.io.FileOutputStream(pngFile)) { fos.write(shot); }
             } catch (Throwable ignored) {}
+
+            // важное: по просьбе — НЕ закрываем браузер
+            if (!KEEP_BROWSER_OPEN) {
+                try { driver.quit(); } catch (Throwable ignored) {}
+            }
 
             return new RenderResult(200, driver.getCurrentUrl(), matched, htmlFile, pngFile);
 
         } catch (Exception e) {
-            // Диагностика при фейле ожиданий
+            // сохраняем диагностику и НЕ закрываем браузер, чтобы можно было посмотреть, что случилось
             try { diagHtml = writeTemp("login-fail-", ".html", driver.getPageSource()); } catch (Throwable ignore) {}
             try {
                 byte[] shot = ((org.openqa.selenium.TakesScreenshot) driver).getScreenshotAs(org.openqa.selenium.OutputType.BYTES);
-                diagPng = File.createTempFile("login-fail-", ".png");
+                diagPng = java.io.File.createTempFile("login-fail-", ".png");
                 try (java.io.FileOutputStream fos = new java.io.FileOutputStream(diagPng)) { fos.write(shot); }
             } catch (Throwable ignore) {}
             if (diagHtml != null) System.err.println("Saved " + diagHtml.getAbsolutePath());
             if (diagPng  != null) System.err.println("Saved " + diagPng.getAbsolutePath());
+
+            if (!KEEP_BROWSER_OPEN) {
+                try { driver.quit(); } catch (Throwable ignore) {}
+            }
             throw e;
-        } finally {
-            driver.quit();
         }
     }
+
 
 
 
