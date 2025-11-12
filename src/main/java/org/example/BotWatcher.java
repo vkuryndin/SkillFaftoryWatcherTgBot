@@ -3,6 +3,7 @@ package org.example;
 import org.jsoup.Connection;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
 
 import org.telegram.telegrambots.longpolling.TelegramBotsLongPollingApplication;
 import org.telegram.telegrambots.longpolling.util.LongPollingSingleThreadUpdateConsumer;
@@ -17,6 +18,8 @@ import org.telegram.telegrambots.meta.api.objects.InputFile;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
 import java.io.*;
+import java.net.URI;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
@@ -26,14 +29,17 @@ import java.util.zip.ZipOutputStream;
 
 public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
 
-    // ENV
+    // ==== ENV ====
     private static final String BOT_TOKEN      = requireEnv("BOT_TOKEN");
     private static final String WATCH_URL      = requireEnv("WATCH_URL");
     private static final String WATCH_COOKIES  = getenvOrDefault("WATCH_COOKIES", ""); // "name=value; name2=value2"
-    private static final String WATCH_SELECTOR = getenvOrDefault("WATCH_SELECTOR", ""); // напр. "main"
+    private static final String WATCH_SELECTOR = getenvOrDefault("WATCH_SELECTOR", ""); // например "main"
 
-    // ЕДИНСТВЕННОЕ поле клиента
+    // ЕДИНСТВЕННЫЙ клиент Telegram
     private final TelegramClient client = new OkHttpTelegramClient(BOT_TOKEN);
+
+    // === Runtime кеш последней диагностики чтобы /open N знал финальный URL и iframe'ы ===
+    private volatile FetchResult lastFetch;
 
     public static void main(String[] args) throws Exception {
         try (TelegramBotsLongPollingApplication app = new TelegramBotsLongPollingApplication()) {
@@ -46,72 +52,45 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
     @Override
     public void consume(Update u) {
         if (u == null || !u.hasMessage() || !u.getMessage().hasText()) return;
-
         long chatId = u.getMessage().getChatId();
-        String cmd = u.getMessage().getText().trim();
+        String text = u.getMessage().getText().trim();
 
-        switch (cmd) {
-            case "/start" -> send(chatId, """
-                    Привет! Команды:
-                    /status — показать конфиг
-                    /check  — хеш страницы
-                    /debug  — HTML в чат (кусками)
-                    /html   — полный HTML файлом
-                    /zip    — HTML в ZIP
-                    /why    — диагностика (status, finalUrl, title, первые 500 символов текста)
-                    """);
-
-            case "/status" -> send(chatId, """
-                    🌐 URL: %s
-                    Cookies заданы: %s
-                    Селектор: %s
-                    Время: %s
-                    """.formatted(WATCH_URL, WATCH_COOKIES.isBlank() ? "нет" : "да",
-                    WATCH_SELECTOR.isBlank() ? "(вся страница)" : WATCH_SELECTOR,
-                    Instant.now()));
-
-            case "/check" -> {
-                try {
-                    FetchResult r = fetchLikeBrowser(WATCH_URL, WATCH_COOKIES, WATCH_SELECTOR);
-                    if (r.loginPage) {
-                        send(chatId, "🔒 Похоже, логин-страница. Обновите WATCH_COOKIES (с того же домена, что и WATCH_URL).");
-                    } else {
-                        send(chatId, "🔎 Хеш: `" + r.hash + "`");
-                    }
-                } catch (Exception e) { send(chatId, "⚠️ Ошибка: " + safe(e)); }
+        try {
+            if ("/start".equals(text)) {
+                send(chatId, """
+                        Привет! Команды:
+                        /status — показать конфиг
+                        /check  — хеш основной страницы
+                        /why    — диагностика (status/finalUrl/title/headers/первые 500 символов)
+                        /iframes — список iframe-ов на основной странице
+                        /open N  — скачать N-й iframe и прислать полный HTML файлом
+                        /debug  — HTML основной страницы (в чат, кусками)
+                        /html   — полный HTML основной страницы (файлом)
+                        /zip    — HTML основной страницы в ZIP
+                        """);
+                return;
             }
 
-            case "/debug" -> {
-                try {
-                    FetchResult r = fetchLikeBrowser(WATCH_URL, WATCH_COOKIES, WATCH_SELECTOR);
-                    sendHtmlPreview(chatId, r.content);
-                } catch (Exception e) { send(chatId, "⚠️ Ошибка: " + safe(e)); }
-            }
+            switch (cmd(text)) {
+                case "status" -> send(chatId, """
+                        🌐 URL: %s
+                        Cookies заданы: %s
+                        Селектор: %s
+                        Время: %s
+                        """.formatted(WATCH_URL, WATCH_COOKIES.isBlank() ? "нет" : "да",
+                        WATCH_SELECTOR.isBlank() ? "(вся страница)" : WATCH_SELECTOR,
+                        Instant.now()));
 
-            case "/html" -> {
-                try {
+                case "check" -> {
                     FetchResult r = fetchLikeBrowser(WATCH_URL, WATCH_COOKIES, WATCH_SELECTOR);
-                    File f = writeTemp("page-", ".html", r.content);
-                    sendFile(chatId, f, "page.html", "Полный HTML");
-                    //noinspection ResultOfMethodCallIgnored
-                    f.delete();
-                } catch (Exception e) { send(chatId, "⚠️ Ошибка: " + safe(e)); }
-            }
+                    lastFetch = r;
+                    if (r.loginPage) send(chatId, "🔒 Похоже, логин-страница. Обновите WATCH_COOKIES.");
+                    send(chatId, "🔎 Хеш основной страницы: `" + r.hash + "`");
+                }
 
-            case "/zip" -> {
-                try {
+                case "why" -> {
                     FetchResult r = fetchLikeBrowser(WATCH_URL, WATCH_COOKIES, WATCH_SELECTOR);
-                    File f = writeZippedHtml("page.html", r.content);
-                    sendFile(chatId, f, "page.zip", "Полный HTML (ZIP)");
-                    //noinspection ResultOfMethodCallIgnored
-                    f.delete();
-                } catch (Exception e) { send(chatId, "⚠️ Ошибка: " + safe(e)); }
-            }
-
-            case "/why" -> {
-                try {
-                    FetchResult r = fetchLikeBrowser(WATCH_URL, WATCH_COOKIES, WATCH_SELECTOR);
-                    String text500 = first(r.text, 500);
+                    lastFetch = r;
                     String diag = """
                             🧪 Диагностика:
                             status: %d
@@ -122,12 +101,70 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                             ---- first 500 chars of text(): 
                             %s
                             """.formatted(r.status, r.finalUrl, nullToEmpty(r.title),
-                            r.loginPage ? "YES" : "no", r.responseHeadersSummary, text500);
+                            r.loginPage ? "YES" : "no", r.responseHeadersSummary, first(r.text, 500));
                     send(chatId, diag);
-                } catch (Exception e) { send(chatId, "⚠️ Ошибка: " + safe(e)); }
-            }
+                }
 
-            default -> send(chatId, "Команды: /status /check /debug /html /zip /why");
+                case "iframes" -> {
+                    FetchResult r = fetchLikeBrowser(WATCH_URL, WATCH_COOKIES, WATCH_SELECTOR);
+                    lastFetch = r;
+                    if (r.iframeUrls.isEmpty()) {
+                        send(chatId, "ℹ️ На основной странице iframe не найдены.");
+                    } else {
+                        StringBuilder sb = new StringBuilder("🪟 Найденные iframe (").append(r.iframeUrls.size()).append("):\n");
+                        for (int i = 0; i < r.iframeUrls.size(); i++) {
+                            sb.append("#").append(i + 1).append(": ").append(r.iframeUrls.get(i)).append("\n");
+                        }
+                        send(chatId, sb.toString());
+                    }
+                }
+
+                case "open" -> {
+                    int idx = parseIndex(text);
+                    if (idx < 1) { send(chatId, "Использование: /open N (N — номер из /iframes)"); return; }
+                    FetchResult base = (lastFetch != null) ? lastFetch : fetchLikeBrowser(WATCH_URL, WATCH_COOKIES, WATCH_SELECTOR);
+                    lastFetch = base;
+                    if (base.iframeUrls.isEmpty()) { send(chatId, "На основной странице нет iframe."); return; }
+                    if (idx > base.iframeUrls.size()) { send(chatId, "Нет такого iframe. Их всего: " + base.iframeUrls.size()); return; }
+
+                    String iframeUrl = base.iframeUrls.get(idx - 1);
+                    FetchResult r = fetchLikeBrowser(iframeUrl, WATCH_COOKIES, ""); // для iframe селектор обычно не нужен
+                    File f = writeTemp("iframe-", ".html", r.content);
+                    sendFile(chatId, f, "iframe-" + idx + ".html", "HTML iframe #" + idx);
+                    //noinspection ResultOfMethodCallIgnored
+                    f.delete();
+                    send(chatId, "🔎 Хеш iframe #" + idx + ": `" + r.hash + "`");
+                }
+
+                case "debug" -> {
+                    FetchResult r = fetchLikeBrowser(WATCH_URL, WATCH_COOKIES, WATCH_SELECTOR);
+                    lastFetch = r;
+                    sendHtmlPreview(chatId, r.content);
+                }
+
+                case "html" -> {
+                    FetchResult r = fetchLikeBrowser(WATCH_URL, WATCH_COOKIES, WATCH_SELECTOR);
+                    lastFetch = r;
+                    File f = writeTemp("page-", ".html", r.content);
+                    sendFile(chatId, f, "page.html", "Полный HTML основной страницы");
+                    //noinspection ResultOfMethodCallIgnored
+                    f.delete();
+                }
+
+                case "zip" -> {
+                    FetchResult r = fetchLikeBrowser(WATCH_URL, WATCH_COOKIES, WATCH_SELECTOR);
+                    lastFetch = r;
+                    File f = writeZippedHtml("page.html", r.content);
+                    sendFile(chatId, f, "page.zip", "Полный HTML основной страницы (ZIP)");
+                    //noinspection ResultOfMethodCallIgnored
+                    f.delete();
+                }
+
+                default -> send(chatId, "Команды: /status /check /why /iframes /open N /debug /html /zip");
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            send(chatId, "⚠️ Ошибка: " + safe(e));
         }
     }
 
@@ -142,8 +179,10 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
         final String hash;
         final boolean loginPage;
         final String responseHeadersSummary;
+        final List<String> iframeUrls;
+
         FetchResult(int status, String finalUrl, String title, String content, String text,
-                    String hash, boolean loginPage, String responseHeadersSummary) {
+                    String hash, boolean loginPage, String responseHeadersSummary, List<String> iframeUrls) {
             this.status = status;
             this.finalUrl = finalUrl;
             this.title = title;
@@ -152,10 +191,11 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
             this.hash = hash;
             this.loginPage = loginPage;
             this.responseHeadersSummary = responseHeadersSummary;
+            this.iframeUrls = iframeUrls;
         }
     }
 
-    /** Запрос, максимально похожий на браузер + ставим и cookies(map), и raw Cookie header. */
+    /** Запрос как у браузера + и Cookie-заголовок строкой, и cookies(map); собираем iframe'ы. */
     private static FetchResult fetchLikeBrowser(String url, String cookieHeader, String selector) throws Exception {
         Connection conn = Jsoup.connect(url)
                 .method(Connection.Method.GET)
@@ -177,19 +217,42 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
         Connection.Response resp = conn.execute();
         int status = resp.statusCode();
         String finalUrl = resp.url().toString();
-        Map<String, String> respHeaders = resp.headers();
-        String headersSummary = summarizeHeaders(respHeaders);
+        String headersSummary = summarizeHeaders(resp.headers());
 
         Document doc = resp.parse();
-        String title = doc.title();
+
         String content = (selector != null && !selector.isBlank() && !doc.select(selector).isEmpty())
                 ? doc.select(selector).outerHtml()
                 : doc.outerHtml();
+
+        String title = doc.title();
         String text = doc.text();
         boolean login = looksLikeLoginPage(finalUrl, title, doc);
         String hash = sha256(content);
 
-        return new FetchResult(status, finalUrl, title, content, text, hash, login, headersSummary);
+        // Собираем iframe src'ы и делаем их абсолютными URL-ами
+        List<String> iframes = new ArrayList<>();
+        for (Element el : doc.select("iframe[src]")) {
+            String src = el.attr("src").trim();
+            if (!src.isEmpty()) {
+                iframes.add(resolveUrl(finalUrl, src));
+            }
+        }
+
+        return new FetchResult(status, finalUrl, title, content, text, hash, login, headersSummary, iframes);
+    }
+
+    private static String resolveUrl(String base, String rel) {
+        try {
+            if (rel.startsWith("http://") || rel.startsWith("https://")) return rel;
+            URL b = new URL(base);
+            return new URL(b, rel).toString();
+        } catch (Exception e) {
+            try {
+                var u = new URI(base).resolve(rel);
+                return u.toString();
+            } catch (Exception ex) { return rel; }
+        }
     }
 
     private static String summarizeHeaders(Map<String,String> h) {
@@ -311,6 +374,26 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
     }
 
     private static String nullToEmpty(String s) { return s == null ? "" : s; }
-    private static String first(String s, int n) { return (s == null || s.length() <= n) ? (s == null ? "" : s) : s.substring(0, n) + "..."; }
-    private static String safe(Throwable t) { String m = t.getMessage(); return (m == null || m.isBlank()) ? t.toString() : m; }
+    private static String first(String s, int n) {
+        if (s == null) return "";
+        return s.length() <= n ? s : s.substring(0, n) + "...";
+    }
+    private static String safe(Throwable t) {
+        String m = t.getMessage();
+        return (m == null || m.isBlank()) ? t.toString() : m;
+    }
+
+    private static String cmd(String text) {
+        String t = text.startsWith("/") ? text.substring(1) : text;
+        int sp = t.indexOf(' ');
+        return (sp < 0 ? t : t.substring(0, sp)).toLowerCase(Locale.ROOT);
+    }
+
+    private static int parseIndex(String text) {
+        try {
+            String[] parts = text.trim().split("\\s+");
+            if (parts.length < 2) return -1;
+            return Integer.parseInt(parts[1]);
+        } catch (Exception e) { return -1; }
+    }
 }
