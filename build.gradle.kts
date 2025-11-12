@@ -19,6 +19,15 @@ dependencies {
     implementation("org.telegram:telegrambots-meta:9.2.0")
     implementation("org.jsoup:jsoup:1.17.2")
     implementation("com.google.code.gson:gson:2.11.0")
+
+    // Логи в консоль
+    implementation("org.slf4j:slf4j-simple:2.0.13")
+
+    // Selenium + авто-драйвер
+    implementation("org.seleniumhq.selenium:selenium-java:4.23.0")
+    implementation("io.github.bonigarcia:webdrivermanager:5.9.2")
+
+
 }
 
 tasks.test {
