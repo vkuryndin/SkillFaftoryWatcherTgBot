@@ -7,27 +7,26 @@ import org.openqa.selenium.support.ui.ExpectedConditions;
 import org.openqa.selenium.support.ui.WebDriverWait;
 
 import java.io.*;
-import java.lang.reflect.Type;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.*;
 
 /**
- * Простой «наблюдатель изменений» страниц после логина (через уже авторизованный Selenium WebDriver).
+ * Наблюдатель изменений страниц в Skillfactory после ЛОГИНА (через уже авторизованный Selenium WebDriver).
  *
  * Идея:
- *  - Для каждой «цели» (Target) выполняем сценарий шагов: GO/CLICK/CLICK_TEXT(_ANY)/WAIT/WAIT_TEXT(_ANY)/SNAP
- *  - По SNAP-селектору достаем нормализованный видимый текст и считаем SHA-256
- *  - Храним прошлые хэши в watch-state.json; если хэш изменился — возвращаем Change (для отправки в Telegram)
+ *  - На каждую «цель» (Target) выполняем сценарий шагов: GO/CLICK/CLICK_TEXT(_ANY/_OR_GO)/WAIT/WAIT_TEXT(_ANY)/SNAP
+ *  - По SNAP-селектору берём видимый нормализованный текст -> считаем SHA-256
+ *  - Предыдущее состояние (хэши) храним в watch-state.json; если хэш изменился — добавляем Change
  *
- * Вызов:
- *  List<ChangeWatcher.Change> changes = ChangeWatcher.runChecks(driver);
- *  (driver уже должен быть авторизован твоим кодом логина)
+ * Вызов из бота после логина:
+ *   var changes = ChangeWatcher.runChecks(driver);
+ *   if (changes.isEmpty()) send("✓ Нет изменений"); else send(changes.get(i).summary());
  */
 public class ChangeWatcher {
 
-    /* ======================= ТАРГЕТЫ (редактируй под себя) ======================= */
+    /* ======================= ТАРГЕТЫ (под себя) ======================= */
 
     static final List<Target> TARGETS = List.of(
             new Target("Course: Home",
@@ -51,8 +50,9 @@ public class ChangeWatcher {
                     Steps.of(
                             Step.go(env("WATCH_URL")),
                             Step.waitSel("#root > *"),
-                            Step.clickText("Программирование на языке Java"),
-                            Step.waitText("Программирование на языке Java"),
+                            // Пытаемся кликнуть по тексту; если не нашли — переходим по прямому URL из ENV WATCH_JAVA_URL (если задан)
+                            Step.clickTextOrGo("Программирование на языке Java", getenvOrEmpty("WATCH_JAVA_URL")),
+                            Step.waitTextAny("Программирование на языке Java", "Java", "Джава"),
                             Step.waitSel("main, #root > *"),
                             Step.snap("main")
                     )
@@ -61,7 +61,7 @@ public class ChangeWatcher {
 
     /* ======================= Публичный API ======================= */
 
-    /** Запустить проверки всех TARGETS. Driver уже должен быть авторизован. */
+    /** Запустить проверки всех TARGETS на уже авторизованном driver. */
     public static List<Change> runChecks(WebDriver driver) throws Exception {
         State state = State.load();
         List<Change> changes = new ArrayList<>();
@@ -78,7 +78,7 @@ public class ChangeWatcher {
                     state.updatedAt.put(t.name, Instant.now().toString());
                 }
             } catch (Exception ex) {
-                // не валим всю проверку из-за одной цели
+                // Не валим всю проверку из-за одной цели
                 System.err.println("Target failed: " + t.name + " — " + ex.getMessage());
             }
         }
@@ -103,37 +103,53 @@ public class ChangeWatcher {
                     waitDomReady(d, 25);
                 }
                 case CLICK_TEXT -> {
-                    WebElement el = findClickableByText(d, s.arg, 35);
-                    new org.openqa.selenium.interactions.Actions(d)
-                            .moveToElement(el).pause(java.time.Duration.ofMillis(120)).click(el).perform();
+                    waitSpaNetworkIdle(d, 15000, 900);
+                    WebElement el = findClickableByTextSmart(d, s.arg, 40);
+                    jsClick(d, el);
                     sleep(700);
                     waitDomReady(d, 25);
+                    waitSpaNetworkIdle(d, 15000, 900);
                 }
                 case CLICK_TEXT_ANY -> {
-                    WebElement el = findClickableByAnyText(d, splitAny(s.arg), 35);
-                    new org.openqa.selenium.interactions.Actions(d)
-                            .moveToElement(el).pause(java.time.Duration.ofMillis(120)).click(el).perform();
+                    waitSpaNetworkIdle(d, 15000, 900);
+                    WebElement el = findClickableByAnyText(d, splitAny(s.arg), 40);
+                    jsClick(d, el);
                     sleep(700);
                     waitDomReady(d, 25);
+                    waitSpaNetworkIdle(d, 15000, 900);
                 }
-                case WAIT -> {
-                    waitVisible(d, s.arg, 25);
+                case CLICK_TEXT_OR_GO -> {
+                    waitSpaNetworkIdle(d, 15000, 900);
+                    List<String> parts = splitAny(s.arg); // [text, fallbackUrl?]
+                    String text = parts.isEmpty() ? "" : parts.get(0);
+                    String fallback = parts.size() >= 2 ? parts.get(1) : "";
+                    try {
+                        WebElement el = findClickableByTextSmart(d, text, 40);
+                        jsClick(d, el);
+                        sleep(800);
+                        waitDomReady(d, 25);
+                        waitSpaNetworkIdle(d, 15000, 900);
+                    } catch (Exception miss) {
+                        if (fallback != null && !fallback.isBlank()) {
+                            ((JavascriptExecutor)d).executeScript("window.location.href = arguments[0];", fallback);
+                            waitDomReady(d, 25);
+                            waitSpaNetworkIdle(d, 15000, 900);
+                        } else {
+                            throw miss;
+                        }
+                    }
                 }
-                case WAIT_TEXT -> {
-                    waitTextPresent(d, s.arg, 30);
-                }
-                case WAIT_TEXT_ANY -> {
-                    waitAnyTextPresent(d, splitAny(s.arg), 30);
-                }
+                case WAIT -> waitVisible(d, s.arg, 30);
+                case WAIT_TEXT -> waitTextPresent(d, s.arg, 30);
+                case WAIT_TEXT_ANY -> waitAnyTextPresent(d, splitAny(s.arg), 30);
                 case SNAP -> {
                     waitVisible(d, s.arg, 30);
-                    // дождаться «сетевой тишины» SPA
                     waitSpaNetworkIdle(d, 15000, 1200);
                     return extractNormalizedText(d, s.arg);
                 }
             }
         }
-        throw new IllegalStateException("Сценарий не завершен шагом SNAP — нечего сравнивать.");
+        throw new IllegalStateException("Сценарий не завершён шагом SNAP — нечего сравнивать.");
     }
 
     /* ======================= Selenium утилиты ======================= */
@@ -165,16 +181,16 @@ public class ChangeWatcher {
         return sb.toString();
     }
 
-    private static WebElement findClickableByText(WebDriver d, String text, int sec){
+    private static WebElement findClickableByTextSmart(WebDriver d, String text, int sec){
         String X = "//*[contains(normalize-space(.), " + escapeXpath(text) + ")]";
-        return new WebDriverWait(d, java.time.Duration.ofSeconds(sec)).until(w -> {
+        WebDriverWait wait = new WebDriverWait(d, java.time.Duration.ofSeconds(sec));
+        return wait.until(w -> {
             List<WebElement> nodes = w.findElements(By.xpath(X));
-            if (nodes.isEmpty()) return null;
             for (WebElement n : nodes) {
                 try {
-                    WebElement clickTarget = n;
+                    // если внутри ссылки/кнопки — кликаем предка <a>/<button>
                     List<WebElement> ab = n.findElements(By.xpath("ancestor-or-self::a | ancestor-or-self::button"));
-                    if (!ab.isEmpty()) clickTarget = ab.get(0);
+                    WebElement clickTarget = ab.isEmpty() ? n : ab.get(0);
                     ((JavascriptExecutor) w).executeScript("arguments[0].scrollIntoView({block:'center'});", clickTarget);
                     if (clickTarget.isDisplayed() && clickTarget.isEnabled()) return clickTarget;
                 } catch (Throwable ignore) {}
@@ -192,15 +208,15 @@ public class ChangeWatcher {
     }
 
     private static WebElement findClickableByAnyText(WebDriver d, List<String> texts, int sec){
-        return new WebDriverWait(d, java.time.Duration.ofSeconds(sec)).until(w -> {
+        WebDriverWait wait = new WebDriverWait(d, java.time.Duration.ofSeconds(sec));
+        return wait.until(w -> {
             for (String t : texts) {
                 String X = "//*[contains(normalize-space(.), " + escapeXpath(t) + ")]";
                 List<WebElement> nodes = w.findElements(By.xpath(X));
                 for (WebElement n : nodes) {
                     try {
-                        WebElement clickTarget = n;
                         List<WebElement> ab = n.findElements(By.xpath("ancestor-or-self::a | ancestor-or-self::button"));
-                        if (!ab.isEmpty()) clickTarget = ab.get(0);
+                        WebElement clickTarget = ab.isEmpty() ? n : ab.get(0);
                         ((JavascriptExecutor) w).executeScript("arguments[0].scrollIntoView({block:'center'});", clickTarget);
                         if (clickTarget.isDisplayed() && clickTarget.isEnabled()) return clickTarget;
                     } catch (Throwable ignore) {}
@@ -225,6 +241,11 @@ public class ChangeWatcher {
                     }
                     return false;
                 });
+    }
+
+    private static void jsClick(WebDriver d, WebElement el){
+        ((JavascriptExecutor)d).executeScript("arguments[0].scrollIntoView({block:'center'});", el);
+        ((JavascriptExecutor)d).executeScript("arguments[0].click();", el);
     }
 
     private static String extractNormalizedText(WebDriver d, String css) {
@@ -299,9 +320,9 @@ public class ChangeWatcher {
     }
 
     private static String sha256(String s) throws Exception {
-        MessageDigest md = MessageDigest.getInstance("SHA-256");
-        byte[] h = md.digest((s == null ? "" : s).getBytes(StandardCharsets.UTF_8));
-        StringBuilder sb = new StringBuilder();
+        byte[] h = MessageDigest.getInstance("SHA-256")
+                .digest((s == null ? "" : s).getBytes(StandardCharsets.UTF_8));
+        StringBuilder sb = new StringBuilder(h.length * 2);
         for (byte b : h) sb.append(String.format("%02x", b));
         return sb.toString();
     }
@@ -311,16 +332,21 @@ public class ChangeWatcher {
         if (v == null || v.isBlank()) throw new IllegalStateException("ENV " + key + " не задан");
         return v;
     }
+    private static String getenvOrEmpty(String key){
+        String v = System.getenv(key);
+        return v == null ? "" : v;
+    }
 
-    /* ======================= МОДЕЛИ/ТИПЫ ШАГОВ ======================= */
+    /* ======================= Модели шагов/таргетов ======================= */
 
-    enum Type { GO, CLICK, CLICK_TEXT, CLICK_TEXT_ANY, WAIT, WAIT_TEXT, WAIT_TEXT_ANY, SNAP }
+    enum Type { GO, CLICK, CLICK_TEXT, CLICK_TEXT_ANY, CLICK_TEXT_OR_GO, WAIT, WAIT_TEXT, WAIT_TEXT_ANY, SNAP }
 
     record Step(Type type, String arg) {
         static Step go(String url){ return new Step(Type.GO, url); }
         static Step click(String css){ return new Step(Type.CLICK, css); }
         static Step clickText(String text){ return new Step(Type.CLICK_TEXT, text); }
         static Step clickTextAny(String... texts){ return new Step(Type.CLICK_TEXT_ANY, String.join("||", texts)); }
+        static Step clickTextOrGo(String text, String fallbackUrl){ return new Step(Type.CLICK_TEXT_OR_GO, text + "||" + (fallbackUrl == null ? "" : fallbackUrl)); }
         static Step waitSel(String css){ return new Step(Type.WAIT, css); }
         static Step waitText(String text){ return new Step(Type.WAIT_TEXT, text); }
         static Step waitTextAny(String... texts){ return new Step(Type.WAIT_TEXT_ANY, String.join("||", texts)); }
@@ -333,7 +359,7 @@ public class ChangeWatcher {
 
     record Target(String name, List<Step> steps) {}
 
-    /* ======================= Cостояние (watch-state.json) ======================= */
+    /* ======================= Состояние (watch-state.json) ======================= */
 
     static class State {
         Map<String, String> hashes = new LinkedHashMap<>();
@@ -366,7 +392,7 @@ public class ChangeWatcher {
         }
     }
 
-    /* ======================= Описание изменений ======================= */
+    /* ======================= Описание изменения ======================= */
 
     public record Change(String name, String prevHash, String newHash, String newText) {
         public String summary() {
