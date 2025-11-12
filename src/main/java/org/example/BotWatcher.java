@@ -278,7 +278,9 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                                                 String password,
                                                 String contentSelector,
                                                 String waitSelectorFallback) throws Exception {
+        // Обязательно: сначала логинимся, потом переходим на targetUrl
         WebDriverManager.chromedriver().setup();
+
         ChromeOptions opts = new ChromeOptions();
         opts.addArguments(
                 "--headless=new",
@@ -288,126 +290,107 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                 "--window-size=1366,3000",
                 "--lang=ru-RU",
                 "--user-agent=" + RENDER_UA,
-                // анти-детект
                 "--disable-blink-features=AutomationControlled"
         );
-        // скрываем шильдик automation
-        opts.setExperimentalOption("excludeSwitches", List.of("enable-automation"));
+        // немного анти-детекта
+        opts.setExperimentalOption("excludeSwitches", java.util.List.of("enable-automation"));
         opts.setExperimentalOption("useAutomationExtension", false);
 
         WebDriver driver = new ChromeDriver(opts);
         File diagLoginHtml = null, diagLoginPng = null;
-        StringBuilder trace = new StringBuilder();
 
         try {
-            String origin = originOf(targetUrl);
-            driver.get(origin);
-            trace.append("open origin: ").append(origin).append("\n");
-
-            // Предварительные cookies (если есть)
-            Map<String,String> ck = parseCookieHeader(cookieHeader);
-            String domain = new java.net.URI(origin).getHost();
-            for (var e : ck.entrySet()) {
-                Cookie c = new Cookie.Builder(e.getKey(), e.getValue())
-                        .domain(domain).path("/").isSecure(true).build();
-                driver.manage().addCookie(c);
+            if (loginUrl == null || loginUrl.isBlank()) {
+                throw new IllegalStateException("WATCH_LOGIN_URL не задан: нужно явно указать URL страницы логина.");
             }
 
-            // 1) Идём на целевую
+            // 0) Если передали куки — поставим их на домен логина (иногда помогает SSO)
+            if (cookieHeader != null && !cookieHeader.isBlank()) {
+                String loginOrigin = originOf(loginUrl);
+                driver.get(loginOrigin);
+                Map<String,String> ck = parseCookieHeader(cookieHeader);
+                String loginHost = new java.net.URI(loginOrigin).getHost();
+                for (var e : ck.entrySet()) {
+                    Cookie c = new Cookie.Builder(e.getKey(), e.getValue())
+                            .domain(loginHost).path("/").isSecure(true).build();
+                    driver.manage().addCookie(c);
+                }
+            }
+
+            // 1) ЯВНО идём на страницу логина apps.skillfactory.ru/learning/login
+            driver.get(loginUrl);
+            waitDomReady(driver, 25);
+
+            // 2) Если логин в iframe — мягко попробуем зайти внутрь
+            try {
+                java.util.List<WebElement> frames = driver.findElements(By.cssSelector("iframe"));
+                for (WebElement f : frames) {
+                    try {
+                        driver.switchTo().frame(f);
+                        if (!driver.findElements(By.cssSelector("input[type='password']")).isEmpty()) break;
+                        driver.switchTo().defaultContent();
+                    } catch (Throwable ignore) { driver.switchTo().defaultContent(); }
+                }
+            } catch (Throwable ignore) {}
+
+            // 3) Установка email/пароля с диспатчем событий (React-friendly) и отправка формы
+            JavascriptExecutor js = (JavascriptExecutor) driver;
+            String setAndSubmit = """
+            (function(email, pass){
+              const $e = document.querySelector("input[name='email']");
+              const $p = document.querySelector("input[name='password']");
+              if(!$e || !$p) return "NO_FIELDS";
+              function setVal(el, val){
+                const last = el.value;
+                el.focus();
+                el.value = val;
+                const inputEvt  = new Event('input',{bubbles:true});
+                const changeEvt = new Event('change',{bubbles:true});
+                el.dispatchEvent(inputEvt);
+                if (last !== val) el.dispatchEvent(changeEvt);
+              }
+              setVal($e, email);
+              setVal($p, pass);
+
+              const form = $e.closest("form") || $p.closest("form") || document.querySelector("form");
+              if (form && typeof form.requestSubmit === 'function') {
+                form.requestSubmit();
+                return "SUBMIT_FORM";
+              }
+              const btn = document.querySelector("button.sf-auth-page-layout__submit-btn, button[type='submit'], input[type='submit']");
+              if (btn) { btn.click(); return "CLICK_BUTTON"; }
+              return "NO_SUBMIT";
+            })(arguments[0], arguments[1]);
+        """;
+            Object submitHow = js.executeScript(setAndSubmit, username, password);
+            System.out.println("Login submit: " + submitHow);
+
+            // 4) Ждём ухода со страницы логина или хотя бы исчезновения password-поля
+            new WebDriverWait(driver, java.time.Duration.ofSeconds(30)).until(d -> {
+                String href = d.getCurrentUrl().toLowerCase(java.util.Locale.ROOT);
+                boolean leftLogin = !href.contains("/learning/login");
+                boolean noPwd = d.findElements(By.cssSelector("input[type='password']")).isEmpty();
+                return leftLogin || noPwd;
+            });
+
+            // 5) Возвращаемся (или переходим) на целевой URL и ждём готовности
+            driver.switchTo().defaultContent();
             driver.get(targetUrl);
             waitDomReady(driver, 25);
-            trace.append("open target: ").append(driver.getCurrentUrl()).append("\n");
 
-            // 2) Если это логин — логинимся
-            if (pageLooksLikeLogin(driver)) {
-                trace.append("looks like login at: ").append(driver.getCurrentUrl()).append("\n");
-
-                // если задан loginUrl — пойдём туда, иначе попробуем логиниться на месте;
-                String actualLoginUrl = (loginUrl != null && !loginUrl.isBlank())
-                        ? loginUrl
-                        : guessLoginUrl(driver.getCurrentUrl()); // попытка угадать lms.skillfactory.ru/login
-
-                if (actualLoginUrl != null) {
-                    driver.get(actualLoginUrl);
-                    waitDomReady(driver, 25);
-                    trace.append("goto login: ").append(driver.getCurrentUrl()).append("\n");
-                }
-
-                // иногда на странице логина есть переключатели "Войти по паролю"/"Через email"
-                clickIfPresent(driver,
-                        "button[id*='password']", "button[class*='password']",
-                        "button:has(span:contains('по паролю'))", "a:contains('по паролю')",
-                        "button:has(span:contains('Email'))", "a:contains('Email')"
-                );
-
-                // найдём поля (ключевые селекторы для Open edX/Keycloak/«обычных» форм)
-                WebElement userEl = findAny(driver,
-                        "input[name='email']",
-                        "input[type='email']",
-                        "input[name='username']",
-                        "#username",
-                        "#id_username",
-                        "input[name='login']"
-                );
-                WebElement passEl = findAny(driver,
-                        "input[name='password']",
-                        "#password",
-                        "#id_password",
-                        "input[type='password']"
-                );
-
-                if (userEl == null || passEl == null) {
-                    // Снимем диагностический дамп формы логина
-                    String html = driver.getPageSource();
-                    diagLoginHtml = writeTemp("login-page-", ".html", html);
-                    try {
-                        byte[] shot = ((TakesScreenshot) driver).getScreenshotAs(OutputType.BYTES);
-                        diagLoginPng = File.createTempFile("login-page-", ".png");
-                        try (FileOutputStream fos = new FileOutputStream(diagLoginPng)) { fos.write(shot); }
-                    } catch (Throwable ignored) {}
-                    throw new IllegalStateException("Не нашёл поля логина/пароля. См. login-page.html/png.");
-                }
-
-                userEl.clear(); userEl.sendKeys(username);
-                passEl.clear(); passEl.sendKeys(password);
-
-                // submit
-                WebElement submitEl = findAny(driver,
-                        "button[type='submit']",
-                        "input[type='submit']",
-                        "#kc-login",                         // Keycloak
-                        "button[class*='login']",            // generic
-                        "button:has(span:contains('Войти'))" // может не работать, если CSS4 не поддержан
-                );
-                if (submitEl != null) submitEl.click(); else passEl.submit();
-
-                // ждём, чтобы ушли с логина/появился контент
-                new WebDriverWait(driver, Duration.ofSeconds(30)).until(d ->
-                        !pageLooksLikeLogin(d)
-                );
-                trace.append("login ok, now: ").append(driver.getCurrentUrl()).append("\n");
-            }
-
-            // 3) Возвращаемся/переходим на целевой (после логина IdP мог редиректнуть куда-то ещё)
-            if (!samePath(driver.getCurrentUrl(), targetUrl)) {
-                driver.get(targetUrl);
-                waitDomReady(driver, 20);
-                trace.append("ensure target: ").append(driver.getCurrentUrl()).append("\n");
-            }
-
-            // 4) Ждём контент (селектор или #root>*)
+            // 6) Ждём контент: либо WATCH_SELECTOR, либо запасной (#root > *)
             String primary = (contentSelector != null && !contentSelector.isBlank()) ? contentSelector : null;
             String fallback = (waitSelectorFallback == null || waitSelectorFallback.isBlank()) ? "#root > *" : waitSelectorFallback;
             boolean matched = waitForSelectorOrRoot(driver, primary, fallback, 20);
 
-            // 5) Немного подождать сеть/ленивые блоки
+            // 7) Лёгкая задержка + скролл для догрузки lazy-блоков
             try { Thread.sleep(800); } catch (InterruptedException ignored) {}
             try {
                 ((JavascriptExecutor) driver).executeScript("window.scrollTo(0, document.body.scrollHeight);");
                 Thread.sleep(400);
             } catch (Throwable ignored) {}
 
-            // 6) HTML + скриншот
+            // 8) Снимаем HTML и скрин
             String html = driver.getPageSource();
             File htmlFile = writeTemp("rendered-", ".html", html);
             File pngFile = null;
@@ -417,17 +400,28 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                 try (FileOutputStream fos = new FileOutputStream(pngFile)) { fos.write(shot); }
             } catch (Throwable ignored) {}
 
-            // Добавим трассу в начало HTML для твоей диагностики (комментом)
-            try (FileWriter fw = new FileWriter(htmlFile, StandardCharsets.UTF_8, true)) {
-                fw.write("\n<!-- TRACE:\n" + trace + "-->\n");
-            } catch (Exception ignored) {}
-
             return new RenderResult(200, driver.getCurrentUrl(), matched, htmlFile, pngFile);
 
+        } catch (Exception e) {
+            // Диагностика формы логина при фейле
+            try {
+                String html = driver.getPageSource();
+                diagLoginHtml = writeTemp("login-page-", ".html", html);
+            } catch (Throwable ignore) {}
+            try {
+                byte[] shot = ((TakesScreenshot) driver).getScreenshotAs(OutputType.BYTES);
+                diagLoginPng = File.createTempFile("login-page-", ".png");
+                try (FileOutputStream fos = new FileOutputStream(diagLoginPng)) { fos.write(shot); }
+            } catch (Throwable ignore) {}
+
+            if (diagLoginHtml != null) System.err.println("Saved " + diagLoginHtml.getAbsolutePath());
+            if (diagLoginPng  != null) System.err.println("Saved " + diagLoginPng.getAbsolutePath());
+            throw e;
         } finally {
             driver.quit();
         }
     }
+
 
 
     /* ================== утилиты/отправка ================== */
