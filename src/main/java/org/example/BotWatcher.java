@@ -286,12 +286,14 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                         send(chatId, "Не удалось отправить watch-state.json: " + safe(e));
                     }
                 }
-                case "/info" -> {
-                    send(chatId,"InfoString");
+                case "info" -> {
+                    send(chatId,"This is a small bot, which is checking whether there are some changes in the Skillfactory pages."
+                    + "Login name and password are not configurable in this version."
+                            + "It checks for Программирование на языке Java, Основы конвейерной разработки и Алгоритмы и структуры данных."
+                    );
                 }
 
-
-                default -> send(chatId, "Команды: /status /check /why /html /iframes /open N /render  /checkjs");
+                default -> send(chatId, "Команды: /status /check /why /html /iframes /open N /render /checkjs  /info");
             }
 
         } catch (Exception e) {
@@ -551,7 +553,6 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
             throw e;
         }
     }
-
 
 
 
