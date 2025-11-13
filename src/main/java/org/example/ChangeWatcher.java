@@ -30,6 +30,7 @@ public class ChangeWatcher {
     /* ======================= СЕЛЕКТОРЫ ДЛЯ JAVA-МЕНЮ ======================= */
 
     // Java-страница курса (3-й пункт в outline)
+    // Модуль программирование на языке Java
     private static final String SEL_JAVA_PAGE =
             "#root > div > div > div > div > main > div > "
                     + "div.sf-outline-page__outline-container > div > nav > ul > li:nth-child(3) > span";

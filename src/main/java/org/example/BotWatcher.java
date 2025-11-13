@@ -100,8 +100,8 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                         /html    — HTML (без JS)
                         /iframes — поиск iframe (без JS)
                         /open N  — скачать iframe N (без JS)
-                        /render  — РЕНДЕР через Chrome: прислать rendered.html + rendered.png
-                        /checkjs — ПРОЙТИ таргеты с логином (Selenium) и прислать изменения
+                        /render  — РЕНДЕР через Chrome: прислать rendered.html + rendered.png (только страница логина)
+                        /checkjs — ПРОЙТИ таргеты с логином (Selenium) и прислать изменения (все поддерживаемые модули)
                         """);
                 return;
             }
@@ -273,6 +273,7 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                         }
                     }
 
+
                     // 4) Отправляем JSON с состоянием (watch-state.json)
                     try {
                         File stateFile = new File(System.getProperty("user.dir"), "watch-state.json");
@@ -285,9 +286,12 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                         send(chatId, "Не удалось отправить watch-state.json: " + safe(e));
                     }
                 }
+                case "/info" -> {
+                    send(chatId,"InfoString");
+                }
 
 
-                default -> send(chatId, "Команды: /status /check /why /html /iframes /open N /render");
+                default -> send(chatId, "Команды: /status /check /why /html /iframes /open N /render  /checkjs");
             }
 
         } catch (Exception e) {
