@@ -22,10 +22,27 @@ import java.util.NoSuchElementException;
  *  - Предыдущее состояние (хэши) храним в watch-state.json; если хэш изменился — добавляем Change
  *
  * Вызов из бота после логина:
- *   var changes = ChangeWatcher.runChecks(driver);
- *   if (changes.isEmpty()) send("✓ Нет изменений"); else send(changes.get(i).summary());
+ *   var res = ChangeWatcher.runChecksWithHtml(driver);
+ *   if (res.changes().isEmpty()) send("✓ Нет изменений"); else send(res.changes().get(i).summary());
  */
 public class ChangeWatcher {
+
+    /* ======================= СЕЛЕКТОРЫ ДЛЯ JAVA-МЕНЮ ======================= */
+
+    // Java-страница курса (3-й пункт в outline)
+    private static final String SEL_JAVA_PAGE =
+            "#root > div > div > div > div > main > div > "
+                    + "div.sf-outline-page__outline-container > div > nav > ul > li:nth-child(3) > span";
+
+    // Модуль «Основы конвейерной разработки» (6-й пункт)
+    private static final String SEL_JAVA_PIPELINE =
+            "#root > div > div > div > div > main > div > "
+                    + "div.sf-outline-page__outline-container > div > nav > ul > li:nth-child(6) > span";
+
+    // Модуль «Алгоритмы и структуры данных» (7-й пункт)
+    private static final String SEL_JAVA_ALGO =
+            "#root > div > div > div > div > main > div > "
+                    + "div.sf-outline-page__outline-container > div > nav > ul > li:nth-child(7) > span";
 
     /* ======================= ТАРГЕТЫ (под себя) ======================= */
 
@@ -47,13 +64,41 @@ public class ChangeWatcher {
                             Step.snap("main, .sf-announce-list, [data-announcements]")
                     )
             ),
+            // 1) Java-страница курса
             new Target("Course: Java page",
                     Steps.of(
                             Step.go(env("WATCH_URL")),
                             Step.waitSel("#root > *"),
-                            // Жёсткий клик по конкретному элементу в outline (3-й пункт — «Программирование на языке Java»)
-                            Step.waitSel("#root > div > div > div > div > main > div > div.sf-outline-page__outline-container > div > nav > ul > li:nth-child(3) > span"),
-                            Step.click("#root > div > div > div > div > main > div > div.sf-outline-page__outline-container > div > nav > ul > li:nth-child(3) > span"),
+                            Step.waitSel(SEL_JAVA_PAGE),
+                            Step.click(SEL_JAVA_PAGE),
+                            Step.waitSel("main, #root > *"),
+                            Step.snap("main")
+                    )
+            ),
+            // 2) Модуль «Основы конвейерной разработки»
+            new Target("Course: Java · Основы конвейерной разработки",
+                    Steps.of(
+                            Step.go(env("WATCH_URL")),
+                            Step.waitSel("#root > *"),
+                            Step.waitSel(SEL_JAVA_PAGE),
+                            Step.click(SEL_JAVA_PAGE),
+                            Step.waitSel("main, #root > *"),
+                            Step.waitSel(SEL_JAVA_PIPELINE),
+                            Step.click(SEL_JAVA_PIPELINE),
+                            Step.waitSel("main, #root > *"),
+                            Step.snap("main")
+                    )
+            ),
+            // 3) Модуль «Алгоритмы и структуры данных»
+            new Target("Course: Java · Алгоритмы и структуры данных",
+                    Steps.of(
+                            Step.go(env("WATCH_URL")),
+                            Step.waitSel("#root > *"),
+                            Step.waitSel(SEL_JAVA_PAGE),
+                            Step.click(SEL_JAVA_PAGE),
+                            Step.waitSel("main, #root > *"),
+                            Step.waitSel(SEL_JAVA_ALGO),
+                            Step.click(SEL_JAVA_ALGO),
                             Step.waitSel("main, #root > *"),
                             Step.snap("main")
                     )
@@ -72,21 +117,27 @@ public class ChangeWatcher {
     /**
      * Новый API: запускает все таргеты и возвращает:
      * - список изменений
-     * - карту HTML-снимков по имени цели.
+     * - карту HTML-снимков по имени цели
+     * - карту PNG-скриншотов по имени цели
      */
     public static RunResult runChecksWithHtml(WebDriver driver) throws Exception {
         State state = State.load();
         List<Change> changes = new ArrayList<>();
         Map<String, String> htmlByTarget = new LinkedHashMap<>();
+        Map<String, File> screenshotByTarget = new LinkedHashMap<>();
 
         for (Target t : TARGETS) {
             try {
                 Snapshot snap = runScenarioAndExtractSnapshot(driver, t.steps);
                 String text = snap.text();
                 String html = snap.html();
+                File screenshot = snap.screenshot();
 
-                // сохраняем HTML для дебага/отправки в бота
+                // сохраняем HTML/скрин для дебага/отправки в бота
                 htmlByTarget.put(t.name(), html);
+                if (screenshot != null) {
+                    screenshotByTarget.put(t.name(), screenshot);
+                }
 
                 String hash = sha256(text);
                 String prev = state.hashes.get(t.name());
@@ -102,7 +153,7 @@ public class ChangeWatcher {
             }
         }
         state.save();
-        return new RunResult(changes, htmlByTarget);
+        return new RunResult(changes, htmlByTarget, screenshotByTarget);
     }
 
     /* ======================= Выполнение сценария ======================= */
@@ -118,64 +169,74 @@ public class ChangeWatcher {
                     WebElement el = findClickable(d, s.arg, 25);
                     new org.openqa.selenium.interactions.Actions(d)
                             .moveToElement(el).pause(java.time.Duration.ofMillis(120)).click(el).perform();
-                    sleep(600);
-                    waitDomReady(d, 25);
+                    sleep(400);
+                    waitDomReady(d, 20);
                 }
                 case CLICK_TEXT -> {
-                    // Кликаем по innerText через JS (в т.ч. для "Программирование на языке Java")
-                    waitSpaNetworkIdle(d, 15000, 900);
-                    clickByInnerTextJs(d, s.arg, 40);
-                    sleep(700);
-                    waitDomReady(d, 25);
-                    waitSpaNetworkIdle(d, 15000, 900);
+                    // Кликаем по innerText через JS
+                    waitSpaNetworkIdle(d, 10000, 700);
+                    clickByInnerTextJs(d, s.arg, 30);
+                    sleep(500);
+                    waitDomReady(d, 20);
+                    waitSpaNetworkIdle(d, 10000, 700);
                 }
                 case CLICK_TEXT_ANY -> {
-                    waitSpaNetworkIdle(d, 15000, 900);
-                    clickAnyByInnerTextJs(d, splitAny(s.arg), 40);
-                    sleep(700);
-                    waitDomReady(d, 25);
-                    waitSpaNetworkIdle(d, 15000, 900);
+                    waitSpaNetworkIdle(d, 10000, 700);
+                    clickAnyByInnerTextJs(d, splitAny(s.arg), 30);
+                    sleep(500);
+                    waitDomReady(d, 20);
+                    waitSpaNetworkIdle(d, 10000, 700);
                 }
                 case CLICK_TEXT_OR_GO -> {
-                    waitSpaNetworkIdle(d, 15000, 900);
+                    waitSpaNetworkIdle(d, 10000, 700);
                     List<String> parts = splitAny(s.arg); // [text, fallbackUrl?]
                     String text = parts.isEmpty() ? "" : parts.get(0);
                     String fallback = parts.size() >= 2 ? parts.get(1) : "";
                     try {
-                        clickByInnerTextJs(d, text, 40);
-                        sleep(800);
-                        waitDomReady(d, 25);
-                        waitSpaNetworkIdle(d, 15000, 900);
+                        clickByInnerTextJs(d, text, 30);
+                        sleep(600);
+                        waitDomReady(d, 20);
+                        waitSpaNetworkIdle(d, 10000, 700);
                     } catch (Exception miss) {
                         if (fallback != null && !fallback.isBlank()) {
                             ((JavascriptExecutor) d).executeScript("window.location.href = arguments[0];", fallback);
-                            waitDomReady(d, 25);
-                            waitSpaNetworkIdle(d, 15000, 900);
+                            waitDomReady(d, 20);
+                            waitSpaNetworkIdle(d, 10000, 700);
                         } else {
                             throw miss;
                         }
                     }
                 }
-                case WAIT -> waitVisible(d, s.arg, 30);
-                case WAIT_TEXT -> waitTextPresent(d, s.arg, 30);
-                case WAIT_TEXT_ANY -> waitAnyTextPresent(d, splitAny(s.arg), 30);
+                case WAIT -> waitVisible(d, s.arg, 20);
+                case WAIT_TEXT -> waitTextPresent(d, s.arg, 20);
+                case WAIT_TEXT_ANY -> waitAnyTextPresent(d, splitAny(s.arg), 20);
                 case SNAP -> {
-                    // 1) Ждём, чтобы целевой блок стал видимым и страница "успокоилась"
-                    waitVisible(d, s.arg, 30);
-                    waitSpaNetworkIdle(d, 15000, 1200);
+                    // 1) Ждём, чтобы целевой блок стал видимым
+                    waitVisible(d, s.arg, 20);
+                    // 2) Ждём «сетевую тишину» НЕМНОГО меньше, чем раньше
+                    waitSpaNetworkIdle(d, 8000, 800);
 
-                    // 2) Берём нормализованный текст — как и раньше
+                    // 3) Берём нормализованный текст — как и раньше
                     String text = extractNormalizedText(d, s.arg);
-                    // 3) Параллельно берём HTML-кусок (или всю страницу, если селектор не найден)
+                    // 4) Параллельно берём HTML-кусок (или всю страницу, если селектор не найден)
                     String html = extractHtml(d, s.arg);
+                    // 5) Делаем скриншот страницы
+                    File screenshot = null;
+                    try {
+                        byte[] shot = ((TakesScreenshot) d).getScreenshotAs(OutputType.BYTES);
+                        screenshot = File.createTempFile("watch-", ".png");
+                        try (FileOutputStream fos = new FileOutputStream(screenshot)) {
+                            fos.write(shot);
+                        }
+                    } catch (Throwable ignored) {
+                    }
 
-                    return new Snapshot(text, html);
+                    return new Snapshot(text, html, screenshot);
                 }
             }
         }
         throw new IllegalStateException("Сценарий не завершён шагом SNAP — нечего сравнивать.");
     }
-
 
     /* ======================= Selenium утилиты ======================= */
 
@@ -194,7 +255,6 @@ public class ChangeWatcher {
         Object res = ((JavascriptExecutor) d).executeScript(script, css);
         return res == null ? "" : res.toString();
     }
-
 
     private static void waitDomReady(WebDriver d, int sec) {
         new WebDriverWait(d, java.time.Duration.ofSeconds(sec))
@@ -224,7 +284,6 @@ public class ChangeWatcher {
     }
 
     // старый findClickableByTextSmart оставим, но больше его не используем в шагах
-
     private static WebElement findClickableByTextSmart(WebDriver d, String text, int sec) {
         String X = "//*[contains(normalize-space(.), " + escapeXpath(text) + ")]";
         WebDriverWait wait = new WebDriverWait(d, java.time.Duration.ofSeconds(sec));
@@ -532,15 +591,17 @@ public class ChangeWatcher {
     }
 
     /**
-     * Результат одного сценария: текст для хэширования + HTML-снимок.
+     * Результат одного сценария: текст для хэширования + HTML-снимок + PNG-скриншот.
      */
-    record Snapshot(String text, String html) {
+    record Snapshot(String text, String html, File screenshot) {
     }
 
     /**
-     * Итог выполнения всех таргетов: изменения + HTML по каждой цели.
+     * Итог выполнения всех таргетов: изменения + HTML/скрины по каждой цели.
      */
-    public record RunResult(List<Change> changes, Map<String, String> htmlByTarget) {
+    public record RunResult(List<Change> changes,
+                            Map<String, String> htmlByTarget,
+                            Map<String, File> screenshotByTarget) {
     }
 
     /* ======================= Описание изменения ======================= */

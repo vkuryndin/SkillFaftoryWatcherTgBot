@@ -200,71 +200,89 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                     // 1) гарантируем, что есть живой авторизованный Chrome
                     WebDriver d = ensureLoggedInDriver();
 
-                    // 2) прогон таргетов, но теперь получаем и HTML-снимки
+                    // 2) прогон таргетов
                     ChangeWatcher.RunResult res = ChangeWatcher.runChecksWithHtml(d);
                     List<ChangeWatcher.Change> changes = res.changes();
                     Map<String, String> htmlByTarget = res.htmlByTarget();
+                    Map<String, File> screenshotsByTarget = res.screenshotByTarget();
 
-                    // 3) репорт + отправка HTML
-                    if (changes.isEmpty()) {
-                        send(chatId, "✓ Нет изменений (JS/после логина)");
+                    // Множество имён таргетов, где были изменения
+                    Set<String> changedNames = new HashSet<>();
+                    for (ChangeWatcher.Change c : changes) {
+                        changedNames.add(c.name());
+                    }
 
-                        // Но для дебага всё равно пришлём HTML последней цели (например, Java-курс)
-                        String lastTargetName = null;
-                        for (ChangeWatcher.Target t : ChangeWatcher.TARGETS) {
-                            lastTargetName = t.name();
-                        }
+                    // 3) Для каждого таргета шлём статус + html + скрин
+                    for (Map.Entry<String, String> e : htmlByTarget.entrySet()) {
+                        String targetName = e.getKey();
+                        String html = e.getValue();
+                        File screenshot = screenshotsByTarget.get(targetName);
 
-                        if (lastTargetName != null) {
-                            String html = htmlByTarget.get(lastTargetName);
-                            if (html != null && !html.isBlank()) {
-                                try {
-                                    File f = writeTemp(
-                                            "checkjs-" + safeFileName(lastTargetName) + "-",
-                                            ".html",
-                                            html
-                                    );
-                                    sendFile(
-                                            chatId,
-                                            f,
-                                            "checkjs-" + safeFileName(lastTargetName) + ".html",
-                                            "JS-rendered HTML для цели: " + lastTargetName
-                                    );
-                                    //noinspection ResultOfMethodCallIgnored
-                                    f.delete();
-                                } catch (Exception e) {
-                                    e.printStackTrace();
-                                    send(chatId, "Не удалось отправить HTML для " + lastTargetName + ": " + safe(e));
-                                }
+                        boolean changed = changedNames.contains(targetName);
+                        String statusMsg = changed
+                                ? "🔔 Изменения в цели: " + targetName
+                                : "✓ Без изменений: " + targetName;
+                        send(chatId, statusMsg);
+
+                        // Если есть Change-объект — шлём краткое summary
+                        for (ChangeWatcher.Change c : changes) {
+                            if (c.name().equals(targetName)) {
+                                send(chatId, c.summary());
+                                break;
                             }
                         }
-                    } else {
-                        // Есть изменения: шлём и summary, и соответствующий HTML
-                        for (var c : changes) {
-                            send(chatId, c.summary());
 
-                            String html = htmlByTarget.get(c.name());
-                            if (html != null && !html.isBlank()) {
-                                try {
-                                    File f = writeTemp(
-                                            "checkjs-" + safeFileName(c.name()) + "-",
-                                            ".html",
-                                            html
-                                    );
-                                    sendFile(
-                                            chatId,
-                                            f,
-                                            "checkjs-" + safeFileName(c.name()) + ".html",
-                                            "JS-rendered HTML для цели: " + c.name()
-                                    );
-                                    //noinspection ResultOfMethodCallIgnored
-                                    f.delete();
-                                } catch (Exception e) {
-                                    e.printStackTrace();
-                                    send(chatId, "Не удалось отправить HTML для " + c.name() + ": " + safe(e));
-                                }
+                        // HTML-фрагмент
+                        if (html != null && !html.isBlank()) {
+                            try {
+                                File f = writeTemp(
+                                        "checkjs-" + safeFileName(targetName) + "-",
+                                        ".html",
+                                        html
+                                );
+                                sendFile(
+                                        chatId,
+                                        f,
+                                        "checkjs-" + safeFileName(targetName) + ".html",
+                                        "JS-rendered HTML для цели: " + targetName
+                                );
+                                //noinspection ResultOfMethodCallIgnored
+                                f.delete();
+                            } catch (Exception e1) {
+                                e1.printStackTrace();
+                                send(chatId, "Не удалось отправить HTML для " + targetName + ": " + safe(e1));
                             }
                         }
+
+                        // PNG-скриншот
+                        if (screenshot != null && screenshot.exists()) {
+                            try {
+                                sendFile(
+                                        chatId,
+                                        screenshot,
+                                        "checkjs-" + safeFileName(targetName) + ".png",
+                                        "Скриншот для цели: " + targetName
+                                );
+                                // Можно удалить temp-файл
+                                //noinspection ResultOfMethodCallIgnored
+                                screenshot.delete();
+                            } catch (Exception e2) {
+                                e2.printStackTrace();
+                                send(chatId, "Не удалось отправить скриншот для " + targetName + ": " + safe(e2));
+                            }
+                        }
+                    }
+
+                    // 4) Отправляем JSON с состоянием (watch-state.json)
+                    try {
+                        File stateFile = new File(System.getProperty("user.dir"), "watch-state.json");
+                        if (stateFile.exists()) {
+                            sendFile(chatId, stateFile, "watch-state.json",
+                                    "Текущее состояние хэшей по всем целям");
+                        }
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                        send(chatId, "Не удалось отправить watch-state.json: " + safe(e));
                     }
                 }
 
