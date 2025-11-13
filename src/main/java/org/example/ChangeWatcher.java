@@ -11,6 +11,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.*;
+import java.util.NoSuchElementException;
 
 /**
  * Наблюдатель изменений страниц в Skillfactory после ЛОГИНА (через уже авторизованный Selenium WebDriver).
@@ -121,17 +122,16 @@ public class ChangeWatcher {
                     waitDomReady(d, 25);
                 }
                 case CLICK_TEXT -> {
+                    // Кликаем по innerText через JS (в т.ч. для "Программирование на языке Java")
                     waitSpaNetworkIdle(d, 15000, 900);
-                    WebElement el = findClickableByTextSmart(d, s.arg, 40);
-                    jsClick(d, el);
+                    clickByInnerTextJs(d, s.arg, 40);
                     sleep(700);
                     waitDomReady(d, 25);
                     waitSpaNetworkIdle(d, 15000, 900);
                 }
                 case CLICK_TEXT_ANY -> {
                     waitSpaNetworkIdle(d, 15000, 900);
-                    WebElement el = findClickableByAnyText(d, splitAny(s.arg), 40);
-                    jsClick(d, el);
+                    clickAnyByInnerTextJs(d, splitAny(s.arg), 40);
                     sleep(700);
                     waitDomReady(d, 25);
                     waitSpaNetworkIdle(d, 15000, 900);
@@ -142,8 +142,7 @@ public class ChangeWatcher {
                     String text = parts.isEmpty() ? "" : parts.get(0);
                     String fallback = parts.size() >= 2 ? parts.get(1) : "";
                     try {
-                        WebElement el = findClickableByTextSmart(d, text, 40);
-                        jsClick(d, el);
+                        clickByInnerTextJs(d, text, 40);
                         sleep(800);
                         waitDomReady(d, 25);
                         waitSpaNetworkIdle(d, 15000, 900);
@@ -224,32 +223,19 @@ public class ChangeWatcher {
         return sb.toString();
     }
 
-    /**
-     * ВАЖНО: умный поиск кликабельного блока по ТОЧНОМУ тексту.
-     * Используем:
-     *   //*[normalize-space(.) = 'Программирование на языке Java']
-     * и поднимаемся к ближайшему кликабельному предку: a | button | li | div.
-     */
-    private static WebElement findClickableByTextSmart(WebDriver d, String text, int sec) {
-        String X = "//*[normalize-space(.) = " + escapeXpath(text) + "]";
+    // старый findClickableByTextSmart оставим, но больше его не используем в шагах
 
+    private static WebElement findClickableByTextSmart(WebDriver d, String text, int sec) {
+        String X = "//*[contains(normalize-space(.), " + escapeXpath(text) + ")]";
         WebDriverWait wait = new WebDriverWait(d, java.time.Duration.ofSeconds(sec));
         return wait.until(w -> {
             List<WebElement> nodes = w.findElements(By.xpath(X));
             for (WebElement n : nodes) {
                 try {
-                    // ищем ближайшего предка, который выглядит как кликабельный контейнер
-                    List<WebElement> ab = n.findElements(By.xpath(
-                            "ancestor-or-self::a | ancestor-or-self::button | ancestor-or-self::li | ancestor-or-self::div"
-                    ));
+                    List<WebElement> ab = n.findElements(By.xpath("ancestor-or-self::a | ancestor-or-self::button"));
                     WebElement clickTarget = ab.isEmpty() ? n : ab.get(0);
-
-                    ((JavascriptExecutor) w).executeScript(
-                            "arguments[0].scrollIntoView({block:'center'});", clickTarget);
-
-                    if (clickTarget.isDisplayed() && clickTarget.isEnabled()) {
-                        return clickTarget;
-                    }
+                    ((JavascriptExecutor) w).executeScript("arguments[0].scrollIntoView({block:'center'});", clickTarget);
+                    if (clickTarget.isDisplayed() && clickTarget.isEnabled()) return clickTarget;
                 } catch (Throwable ignore) {
                 }
             }
@@ -272,19 +258,14 @@ public class ChangeWatcher {
         WebDriverWait wait = new WebDriverWait(d, java.time.Duration.ofSeconds(sec));
         return wait.until(w -> {
             for (String t : texts) {
-                String X = "//*[normalize-space(.) = " + escapeXpath(t) + "]";
+                String X = "//*[contains(normalize-space(.), " + escapeXpath(t) + ")]";
                 List<WebElement> nodes = w.findElements(By.xpath(X));
                 for (WebElement n : nodes) {
                     try {
-                        List<WebElement> ab = n.findElements(By.xpath(
-                                "ancestor-or-self::a | ancestor-or-self::button | ancestor-or-self::li | ancestor-or-self::div"
-                        ));
+                        List<WebElement> ab = n.findElements(By.xpath("ancestor-or-self::a | ancestor-or-self::button"));
                         WebElement clickTarget = ab.isEmpty() ? n : ab.get(0);
-                        ((JavascriptExecutor) w).executeScript(
-                                "arguments[0].scrollIntoView({block:'center'});", clickTarget);
-                        if (clickTarget.isDisplayed() && clickTarget.isEnabled()) {
-                            return clickTarget;
-                        }
+                        ((JavascriptExecutor) w).executeScript("arguments[0].scrollIntoView({block:'center'});", clickTarget);
+                        if (clickTarget.isDisplayed() && clickTarget.isEnabled()) return clickTarget;
                     } catch (Throwable ignore) {
                     }
                 }
@@ -313,6 +294,56 @@ public class ChangeWatcher {
     private static void jsClick(WebDriver d, WebElement el) {
         ((JavascriptExecutor) d).executeScript("arguments[0].scrollIntoView({block:'center'});", el);
         ((JavascriptExecutor) d).executeScript("arguments[0].click();", el);
+    }
+
+    /**
+     * Клик по видимому элементу, чей innerText содержит указанный текст (регистр неважен).
+     * Работает даже если это React-карточка / див / что угодно.
+     */
+    private static void clickByInnerTextJs(WebDriver d, String text, int sec) {
+        final String script = """
+                const needle = (arguments[0] || "").toLowerCase().trim();
+                if (!needle) return false;
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, null);
+                let cand = null;
+                while (walker.nextNode()) {
+                  const el = walker.currentNode;
+                  if (!el) continue;
+                  const style = window.getComputedStyle(el);
+                  if (style.visibility === 'hidden' || style.display === 'none') continue;
+                  if (el.offsetWidth === 0 && el.offsetHeight === 0) continue;
+                  const txt = (el.innerText || el.textContent || "").toLowerCase().replace(/\\s+/g, " ").trim();
+                  if (!txt) continue;
+                  if (txt.includes(needle)) { cand = el; break; }
+                }
+                if (!cand) return false;
+                cand.scrollIntoView({block: 'center'});
+                cand.click();
+                return true;
+                """;
+
+        WebDriverWait wait = new WebDriverWait(d, java.time.Duration.ofSeconds(sec));
+        Boolean ok = wait.until(w -> {
+            Object r = ((JavascriptExecutor) w).executeScript(script, text);
+            return Boolean.TRUE.equals(r);
+        });
+        if (!Boolean.TRUE.equals(ok)) {
+            throw new NoSuchElementException("Не найден видимый элемент с текстом: " + text);
+        }
+    }
+
+    /**
+     * Перебирает варианты текста и кликает по первому успешному.
+     */
+    private static void clickAnyByInnerTextJs(WebDriver d, List<String> texts, int sec) {
+        for (String t : texts) {
+            try {
+                clickByInnerTextJs(d, t, sec);
+                return;
+            } catch (Exception ignored) {
+            }
+        }
+        throw new NoSuchElementException("Не найден ни один текст: " + texts);
     }
 
     private static String extractNormalizedText(WebDriver d, String css) {
@@ -372,7 +403,7 @@ public class ChangeWatcher {
             try {
                 Long pending = ((Number) js.executeScript("return (window.__pendingRequests||0);")).longValue();
                 Boolean hasSkeleton = (Boolean) js.executeScript(
-                        "return !!document.querySelector('.sf-skeleton, .skeleton, [data-loading=\\\"true\\\"], [aria-busy=\\\"true\\\"]);"
+                        "return !!document.querySelector('.sf-skeleton, .skeleton, [data-loading=\"true\"], [aria-busy=\"true\"]);"
                 );
                 if (pending == 0 && !Boolean.TRUE.equals(hasSkeleton)) {
                     if (quietSince < 0) quietSince = System.currentTimeMillis();
