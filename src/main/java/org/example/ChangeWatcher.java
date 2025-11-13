@@ -224,18 +224,32 @@ public class ChangeWatcher {
         return sb.toString();
     }
 
+    /**
+     * ВАЖНО: умный поиск кликабельного блока по ТОЧНОМУ тексту.
+     * Используем:
+     *   //*[normalize-space(.) = 'Программирование на языке Java']
+     * и поднимаемся к ближайшему кликабельному предку: a | button | li | div.
+     */
     private static WebElement findClickableByTextSmart(WebDriver d, String text, int sec) {
-        String X = "//*[contains(normalize-space(.), " + escapeXpath(text) + ")]";
+        String X = "//*[normalize-space(.) = " + escapeXpath(text) + "]";
+
         WebDriverWait wait = new WebDriverWait(d, java.time.Duration.ofSeconds(sec));
         return wait.until(w -> {
             List<WebElement> nodes = w.findElements(By.xpath(X));
             for (WebElement n : nodes) {
                 try {
-                    // если внутри ссылки/кнопки — кликаем предка <a>/<button>
-                    List<WebElement> ab = n.findElements(By.xpath("ancestor-or-self::a | ancestor-or-self::button"));
+                    // ищем ближайшего предка, который выглядит как кликабельный контейнер
+                    List<WebElement> ab = n.findElements(By.xpath(
+                            "ancestor-or-self::a | ancestor-or-self::button | ancestor-or-self::li | ancestor-or-self::div"
+                    ));
                     WebElement clickTarget = ab.isEmpty() ? n : ab.get(0);
-                    ((JavascriptExecutor) w).executeScript("arguments[0].scrollIntoView({block:'center'});", clickTarget);
-                    if (clickTarget.isDisplayed() && clickTarget.isEnabled()) return clickTarget;
+
+                    ((JavascriptExecutor) w).executeScript(
+                            "arguments[0].scrollIntoView({block:'center'});", clickTarget);
+
+                    if (clickTarget.isDisplayed() && clickTarget.isEnabled()) {
+                        return clickTarget;
+                    }
                 } catch (Throwable ignore) {
                 }
             }
@@ -258,14 +272,19 @@ public class ChangeWatcher {
         WebDriverWait wait = new WebDriverWait(d, java.time.Duration.ofSeconds(sec));
         return wait.until(w -> {
             for (String t : texts) {
-                String X = "//*[contains(normalize-space(.), " + escapeXpath(t) + ")]";
+                String X = "//*[normalize-space(.) = " + escapeXpath(t) + "]";
                 List<WebElement> nodes = w.findElements(By.xpath(X));
                 for (WebElement n : nodes) {
                     try {
-                        List<WebElement> ab = n.findElements(By.xpath("ancestor-or-self::a | ancestor-or-self::button"));
+                        List<WebElement> ab = n.findElements(By.xpath(
+                                "ancestor-or-self::a | ancestor-or-self::button | ancestor-or-self::li | ancestor-or-self::div"
+                        ));
                         WebElement clickTarget = ab.isEmpty() ? n : ab.get(0);
-                        ((JavascriptExecutor) w).executeScript("arguments[0].scrollIntoView({block:'center'});", clickTarget);
-                        if (clickTarget.isDisplayed() && clickTarget.isEnabled()) return clickTarget;
+                        ((JavascriptExecutor) w).executeScript(
+                                "arguments[0].scrollIntoView({block:'center'});", clickTarget);
+                        if (clickTarget.isDisplayed() && clickTarget.isEnabled()) {
+                            return clickTarget;
+                        }
                     } catch (Throwable ignore) {
                     }
                 }
@@ -353,7 +372,7 @@ public class ChangeWatcher {
             try {
                 Long pending = ((Number) js.executeScript("return (window.__pendingRequests||0);")).longValue();
                 Boolean hasSkeleton = (Boolean) js.executeScript(
-                        "return !!document.querySelector('.sf-skeleton, .skeleton, [data-loading=\"true\"], [aria-busy=\"true\"]);"
+                        "return !!document.querySelector('.sf-skeleton, .skeleton, [data-loading=\\\"true\\\"], [aria-busy=\\\"true\\\"]);"
                 );
                 if (pending == 0 && !Boolean.TRUE.equals(hasSkeleton)) {
                     if (quietSince < 0) quietSince = System.currentTimeMillis();
