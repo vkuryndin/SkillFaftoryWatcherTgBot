@@ -200,18 +200,74 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
                     // 1) гарантируем, что есть живой авторизованный Chrome
                     WebDriver d = ensureLoggedInDriver();
 
-                    // 2) прогон таргетов из ChangeWatcher (go/clickText/wait/snap/хеш)
-                    var changes = ChangeWatcher.runChecks(d);
+                    // 2) прогон таргетов, но теперь получаем и HTML-снимки
+                    ChangeWatcher.RunResult res = ChangeWatcher.runChecksWithHtml(d);
+                    List<ChangeWatcher.Change> changes = res.changes();
+                    Map<String, String> htmlByTarget = res.htmlByTarget();
 
-                    // 3) репорт
+                    // 3) репорт + отправка HTML
                     if (changes.isEmpty()) {
                         send(chatId, "✓ Нет изменений (JS/после логина)");
+
+                        // Но для дебага всё равно пришлём HTML последней цели (например, Java-курс)
+                        String lastTargetName = null;
+                        for (ChangeWatcher.Target t : ChangeWatcher.TARGETS) {
+                            lastTargetName = t.name();
+                        }
+
+                        if (lastTargetName != null) {
+                            String html = htmlByTarget.get(lastTargetName);
+                            if (html != null && !html.isBlank()) {
+                                try {
+                                    File f = writeTemp(
+                                            "checkjs-" + safeFileName(lastTargetName) + "-",
+                                            ".html",
+                                            html
+                                    );
+                                    sendFile(
+                                            chatId,
+                                            f,
+                                            "checkjs-" + safeFileName(lastTargetName) + ".html",
+                                            "JS-rendered HTML для цели: " + lastTargetName
+                                    );
+                                    //noinspection ResultOfMethodCallIgnored
+                                    f.delete();
+                                } catch (Exception e) {
+                                    e.printStackTrace();
+                                    send(chatId, "Не удалось отправить HTML для " + lastTargetName + ": " + safe(e));
+                                }
+                            }
+                        }
                     } else {
+                        // Есть изменения: шлём и summary, и соответствующий HTML
                         for (var c : changes) {
                             send(chatId, c.summary());
+
+                            String html = htmlByTarget.get(c.name());
+                            if (html != null && !html.isBlank()) {
+                                try {
+                                    File f = writeTemp(
+                                            "checkjs-" + safeFileName(c.name()) + "-",
+                                            ".html",
+                                            html
+                                    );
+                                    sendFile(
+                                            chatId,
+                                            f,
+                                            "checkjs-" + safeFileName(c.name()) + ".html",
+                                            "JS-rendered HTML для цели: " + c.name()
+                                    );
+                                    //noinspection ResultOfMethodCallIgnored
+                                    f.delete();
+                                } catch (Exception e) {
+                                    e.printStackTrace();
+                                    send(chatId, "Не удалось отправить HTML для " + c.name() + ": " + safe(e));
+                                }
+                            }
                         }
                     }
                 }
+
 
                 default -> send(chatId, "Команды: /status /check /why /html /iframes /open N /render");
             }
@@ -734,6 +790,12 @@ public class BotWatcher implements LongPollingSingleThreadUpdateConsumer {
             try { Thread.sleep(200); } catch (InterruptedException ignored) {}
         }
     }
+    private static String safeFileName(String s) {
+        if (s == null) return "target";
+        String cleaned = s.replaceAll("[^a-zA-Z0-9._-]+", "_");
+        return cleaned.isBlank() ? "target" : cleaned;
+    }
+
 
 
 }
