@@ -51,9 +51,9 @@ public class ChangeWatcher {
                     Steps.of(
                             Step.go(env("WATCH_URL")),
                             Step.waitSel("#root > *"),
-                            // Пытаемся кликнуть по тексту; если не нашли — переходим по прямому URL из ENV WATCH_JAVA_URL (если задан)
-                            Step.clickTextOrGo("Программирование на языке Java", getenvOrEmpty("WATCH_JAVA_URL")),
-                            Step.waitTextAny("Программирование на языке Java", "Java", "Джава"),
+                            // Жёсткий клик по конкретному элементу в outline (3-й пункт — «Программирование на языке Java»)
+                            Step.waitSel("#root > div > div > div > div > main > div > div.sf-outline-page__outline-container > div > nav > ul > li:nth-child(3) > span"),
+                            Step.click("#root > div > div > div > div > main > div > div.sf-outline-page__outline-container > div > nav > ul > li:nth-child(3) > span"),
                             Step.waitSel("main, #root > *"),
                             Step.snap("main")
                     )
